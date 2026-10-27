@@ -18,3 +18,9 @@ Built every week from the OpenStreetMap planet by `.github/workflows/rail.yml`, 
 **License:** the data is © OpenStreetMap contributors, available under the
 [Open Database License 1.0](https://opendatacommons.org/licenses/odbl/1-0/). See
 https://www.openstreetmap.org/copyright.
+
+## fra/: US level crossings (weekly)
+
+`fra/<x>/<y>.json.gz` per zoom-7 tile: the US Federal Railroad Administration's Highway-Rail Crossing Inventory, its
+open at-grade crossings as `[lat, lon, kit]` (kit: `gate`, `flash` or `cross`), built by `tools/build_fra_shards.py`.
+Public domain (a work of the US government).

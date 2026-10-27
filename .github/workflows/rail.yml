@@ -1,7 +1,7 @@
-# OpenStreetMap's railways, rebuilt weekly from the planet and published to this repo's GitHub Pages (rail/), read by
-# BeamNG.Earth's server/railtags.py. The planet is streamed twice (curl into the builder): nothing is stored, so a
+# BeamNG.Earth's runtime data, rebuilt weekly and published to this repo's GitHub Pages: OpenStreetMap's railways
+# (rail/, read by server/railtags.py) and the FRA's level crossings (fra/, server/fra.py). The planet is streamed twice (curl into the builder): nothing is stored, so a
 # standard runner's disk is enough. Data (c) OpenStreetMap contributors, ODbL 1.0.
-name: rail
+name: data
 
 on:
   schedule:
@@ -38,12 +38,17 @@ jobs:
           test -n "$NAME"
           echo "url=$MIRROR/$NAME" >> "$GITHUB_OUTPUT"
           echo "Planet: $NAME"
+      - name: "FRA level crossings (tools/build_fra_shards.py)"
+        continue-on-error: true
+        run: |
+          curl -sfL -o build_fra_shards.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/tools/build_fra_shards.py
+          python build_fra_shards.py site/fra
       - name: Build
         run: python build_rail_tags.py "${{ steps.planet.outputs.url }}" site/rail
       - name: Site
         run: |
           cp README.md site/
-          printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>. Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
+          printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>, level crossings (US): <a href="fra/manifest.json">fra/manifest.json</a>. Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
           echo "${{ steps.planet.outputs.url }}" > site/rail/planet.txt
       - uses: actions/upload-pages-artifact@v3
         with:
