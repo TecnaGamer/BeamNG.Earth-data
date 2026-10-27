@@ -1,0 +1,60 @@
+# OpenStreetMap's railways, rebuilt weekly from the planet and published to this repo's GitHub Pages (rail/), read by
+# BeamNG.Earth's server/railtags.py. The planet is streamed twice (curl into the builder): nothing is stored, so a
+# standard runner's disk is enough. Data (c) OpenStreetMap contributors, ODbL 1.0.
+name: rail
+
+on:
+  schedule:
+    - cron: "17 3 * * 5"            # Fridays 03:17 UTC (a new planet appears on Thursdays)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tools
+        run: pip install "osmium==4.3.2" numpy
+      - name: The builder (BeamNG.Earth's tools/build_rail_tags.py)
+        run: curl -sfL -o build_rail_tags.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/tools/build_rail_tags.py
+      - name: The newest planet (a dated file: both passes read the same week's)
+        id: planet
+        run: |
+          MIRROR=https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf
+          NAME=$(curl -sfL "$MIRROR/" | grep -oE 'planet-[0-9]{6}\.osm\.pbf' | sort -u | tail -1)
+          test -n "$NAME"
+          echo "url=$MIRROR/$NAME" >> "$GITHUB_OUTPUT"
+          echo "Planet: $NAME"
+      - name: Build
+        run: python build_rail_tags.py "${{ steps.planet.outputs.url }}" site/rail
+      - name: Site
+        run: |
+          cp README.md site/
+          printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>. Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
+          echo "${{ steps.planet.outputs.url }}" > site/rail/planet.txt
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
