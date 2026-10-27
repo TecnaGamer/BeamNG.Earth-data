@@ -28,9 +28,9 @@ jobs:
           python-version: "3.12"
       - name: Tools
         run: pip install "osmium==4.3.2" numpy
-      - name: The builder (BeamNG.Earth's tools/build_rail_tags.py)
+      - name: "The builder (tools/build_rail_tags.py from BeamNG.Earth)"
         run: curl -sfL -o build_rail_tags.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/tools/build_rail_tags.py
-      - name: The newest planet (a dated file: both passes read the same week's)
+      - name: "The newest planet (a dated file, so both passes read the same week)"
         id: planet
         run: |
           MIRROR=https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf
