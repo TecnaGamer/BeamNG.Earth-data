@@ -1,5 +1,7 @@
 # BeamNG.Earth's runtime data, rebuilt weekly and published to this repo's GitHub Pages: OpenStreetMap's railways
-# (rail/, read by server/railtags.py) and the FRA's level crossings (fra/, server/fra.py). The planet is streamed twice (curl into the builder): nothing is stored, so a
+# (rail/, read by server/railtags.py), its lane-level road tags (lanes/, railtags.LaneTags) and the FRA's level
+# crossings (fra/, server/fra.py). The two planet builds run as parallel jobs (each streams the planet twice); the
+# site job puts them together (a Pages deployment replaces the whole site). The planet is streamed twice (curl into the builder): nothing is stored, so a
 # standard runner's disk is enough. Data (c) OpenStreetMap contributors, ODbL 1.0.
 name: data
 
@@ -18,19 +20,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  planet:
     runs-on: ubuntu-latest
-    timeout-minutes: 340
+    outputs:
+      url: ${{ steps.planet.outputs.url }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Tools
-        run: pip install "osmium==4.3.2" numpy
-      - name: "The builder (tools/build_rail_tags.py from BeamNG.Earth)"
-        run: curl -sfL -o build_rail_tags.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/tools/build_rail_tags.py
-      - name: "The newest planet (a dated file, so both passes read the same week)"
+      - name: "The newest planet (a dated file, so every pass reads the same week)"
         id: planet
         run: |
           MIRROR=https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf
@@ -38,24 +33,80 @@ jobs:
           test -n "$NAME"
           echo "url=$MIRROR/$NAME" >> "$GITHUB_OUTPUT"
           echo "Planet: $NAME"
+
+  rail:
+    needs: planet
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tools
+        run: pip install "osmium==4.3.2" numpy
+      - name: "The builder (tools/build_rail_tags.py from BeamNG.Earth)"
+        run: curl -sfL -o build_rail_tags.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/tools/build_rail_tags.py
       - name: "FRA level crossings (tools/build_fra_shards.py)"
         continue-on-error: true
         run: |
           curl -sfL -o build_fra_shards.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/tools/build_fra_shards.py
-          python build_fra_shards.py site/fra
+          python build_fra_shards.py out/fra
       - name: Build
-        run: python build_rail_tags.py "${{ steps.planet.outputs.url }}" site/rail
+        run: |
+          python build_rail_tags.py "${{ needs.planet.outputs.url }}" out/rail
+          echo "${{ needs.planet.outputs.url }}" > out/rail/planet.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rail
+          path: out
+          retention-days: 3
+
+  lanes:
+    needs: planet
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tools
+        run: pip install "osmium==4.3.2" numpy
+      - name: "The builder (tools/build_lane_tags.py from BeamNG.Earth, with build_rail_tags.py it uses)"
+        run: |
+          curl -sfL -o build_rail_tags.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/tools/build_rail_tags.py
+          curl -sfL -o build_lane_tags.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/tools/build_lane_tags.py
+      - name: Build
+        run: |
+          python build_lane_tags.py "${{ needs.planet.outputs.url }}" out/lanes
+          echo "${{ needs.planet.outputs.url }}" > out/lanes/planet.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lanes
+          path: out
+          retention-days: 3
+
+  site:
+    needs: [rail, lanes]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: parts
       - name: Site
         run: |
+          mkdir -p site
+          cp -r parts/rail/* site/
+          cp -r parts/lanes/* site/
           cp README.md site/
-          printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>, level crossings (US): <a href="fra/manifest.json">fra/manifest.json</a>. Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
-          echo "${{ steps.planet.outputs.url }}" > site/rail/planet.txt
+          printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>, lane-level road tags: <a href="lanes/manifest.json">lanes/manifest.json</a>, level crossings (US): <a href="fra/manifest.json">fra/manifest.json</a>. Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
+          ls site
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
 
   deploy:
-    needs: build
+    needs: site
     runs-on: ubuntu-latest
     environment:
       name: github-pages

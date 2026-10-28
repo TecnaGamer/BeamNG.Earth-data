@@ -15,6 +15,14 @@ gauge, and give level crossings their gates and lights.
 Built every week from the OpenStreetMap planet by `.github/workflows/rail.yml`, with
 `tools/build_rail_tags.py` from the BeamNG.Earth repository.
 
+## lanes/: OpenStreetMap's lane-level road tags (weekly)
+
+`lanes/<x>/<y>.json.gz` per zoom-7 tile: the lane tags of every OpenStreetMap highway that has any (turn:lanes,
+change:lanes, placement, lanes:forward / backward / both_ways, overtaking, divider, lane_markings, width:lanes, bus /
+HOV lanes, ...) by way id. BeamNG.Earth joins them to Overture Maps' road segments (`server/railtags.py` LaneTags) to
+paint the road markings lane by lane and give the traffic the same lanes. Built by the same workflow with
+`tools/build_lane_tags.py`.
+
 **License:** the data is © OpenStreetMap contributors, available under the
 [Open Database License 1.0](https://opendatacommons.org/licenses/odbl/1-0/). See
 https://www.openstreetmap.org/copyright.
