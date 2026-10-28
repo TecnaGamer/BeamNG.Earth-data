@@ -1,6 +1,6 @@
 # BeamNG.Earth's runtime data, rebuilt weekly and published to this repo's GitHub Pages: OpenStreetMap's railways
-# (rail/, read by server/railtags.py), its lane-level road tags (lanes/, railtags.LaneTags) and the FRA's level
-# crossings (fra/, server/fra.py). The two planet builds run as parallel jobs (each streams the planet twice); the
+# (rail/, read by server/railtags.py), its lane-level road tags (lanes/, railtags.LaneTags), its highway sign sources (signs/, railtags.SignTags: exits, overhead destinations, mile references) and the FRA's level
+# crossings (fra/, server/fra.py). The planet builds run as parallel jobs (each streams the planet twice); the
 # site job puts them together (a Pages deployment replaces the whole site). The planet is streamed twice (curl into the builder): nothing is stored, so a
 # standard runner's disk is enough. Data (c) OpenStreetMap contributors, ODbL 1.0.
 name: data
@@ -85,8 +85,37 @@ jobs:
           path: out
           retention-days: 3
 
+  signs:
+    needs: planet
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tools
+        run: pip install "osmium==4.3.2" numpy
+      - name: "The builder (tools/build_sign_tags.py from BeamNG.Earth, with the sign modules it indexes with)"
+        run: |
+          B=https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev
+          for f in tools/build_sign_tags.py tools/build_rail_tags.py server/exitsigns.py server/throughsigns.py \
+                   server/milemarkers.py server/routeshields.py server/signshards.py; do
+            curl -sfL -o "$(basename "$f")" "$B/$f"
+          done
+      - name: Build
+        run: |
+          python build_sign_tags.py "${{ needs.planet.outputs.url }}" out/signs
+          echo "${{ needs.planet.outputs.url }}" > out/signs/planet.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signs
+          path: out
+          retention-days: 3
+
   site:
-    needs: [rail, lanes]
+    needs: [rail, lanes, signs]
+    # (the sign shards are optional: a failed signs job leaves them out, the rail and lane data still publish)
+    if: ${{ !cancelled() && needs.rail.result == 'success' && needs.lanes.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -98,8 +127,9 @@ jobs:
           mkdir -p site
           cp -r parts/rail/* site/
           cp -r parts/lanes/* site/
+          if [ -d parts/signs ]; then cp -r parts/signs/* site/; fi
           cp README.md site/
-          printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>, lane-level road tags: <a href="lanes/manifest.json">lanes/manifest.json</a>, level crossings (US): <a href="fra/manifest.json">fra/manifest.json</a>. Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
+          printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>, lane-level road tags: <a href="lanes/manifest.json">lanes/manifest.json</a>, highway sign sources: <a href="signs/manifest.json">signs/manifest.json</a>, level crossings (US): <a href="fra/manifest.json">fra/manifest.json</a>. Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
           ls site
       - uses: actions/upload-pages-artifact@v3
         with:
