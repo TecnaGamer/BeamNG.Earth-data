@@ -1,0 +1,135 @@
+# BeamNG.Earth's own tile host (Cloudflare R2 behind its CDN, bucket bnge-tiles): Sentinel-2 photo packs of the whole
+# land (server/tilepack.py, imagery source "bngs2"), built from ESA WorldCover's 2021 Sentinel-2 RGBNIR composite
+# (CC BY 4.0, "Contains modified Copernicus Sentinel data 2021") by tools/build_s2_packs.py from BeamNG.Earth's dev
+# branch. Manual only: Actions -> tiles -> Run workflow. Players use the packs only when cdn.json (this repo) turns
+# "bngs2" on.
+#   regions: "all" (every zoom-5 tile with land) or a list "x,y x,y" of zoom-5 tiles
+#   coarse: also build zooms 7..3 from the zoom-8 packs in the bucket (after the regions)
+# Secrets (repo settings): R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY (an R2 token: Object Read & Write,
+# this bucket only).
+name: tiles
+
+on:
+  workflow_dispatch:
+    inputs:
+      regions:
+        description: 'zoom-5 tiles: "all" or "x,y x,y ..."'
+        default: "all"
+      coarse:
+        description: "build zooms 7..3 too (true/false)"
+        default: "true"
+
+permissions:
+  contents: read
+
+env:
+  BUCKET: bnge-tiles
+  PREFIX: s2wc/v1
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      chunks: ${{ steps.plan.outputs.chunks }}
+    steps:
+      - id: plan
+        name: "The zoom-5 tiles with land (from the composite's 1-degree file list), in chunks"
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, math, re, urllib.parse, urllib.request
+          want = """${{ github.event.inputs.regions }}""".strip()
+          if want and want != "all":
+              tiles = sorted({tuple(int(v) for v in t.split(",")) for t in want.split()})
+          else:
+              names, token = [], None
+              while True:
+                  u = "https://esa-worldcover-s2.s3.eu-central-1.amazonaws.com/?list-type=2&prefix=rgbnir/2021/&max-keys=1000"
+                  if token:
+                      u += "&continuation-token=" + urllib.parse.quote(token)
+                  body = urllib.request.urlopen(u, timeout=60).read().decode()
+                  names += re.findall(r"_([NS]\d\d)([EW]\d{3})_S2RGBNIR\.tif", body)
+                  m = re.search(r"<NextContinuationToken>([^<]+)</NextContinuationToken>", body)
+                  if not m:
+                      break
+                  token = m.group(1)
+              tiles = set()
+              for ns, ew in names:
+                  la = int(ns[1:]) * (1 if ns[0] == "N" else -1)
+                  lo = int(ew[1:]) * (1 if ew[0] == "E" else -1)
+                  for dla in (0.0, 0.999):
+                      for dlo in (0.0, 0.999):
+                          lat, lon = max(-85.0, min(85.0, la + dla)), lo + dlo
+                          x = int((lon + 180) / 360 * 32)
+                          y = int((1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * 32)
+                          tiles.add((min(31, x), min(31, max(0, y))))
+              tiles = sorted(tiles)
+          per = max(1, math.ceil(len(tiles) / 200))      # (a matrix takes at most 256 jobs)
+          chunks = [" ".join(f"{x},{y}" for x, y in tiles[i:i + per]) for i in range(0, len(tiles), per)]
+          print("chunks=" + json.dumps(chunks))
+          PY
+        shell: bash
+
+  regions:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        chunk: ${{ fromJson(needs.plan.outputs.chunks) }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy pillow
+      - name: "The builder (tools/build_s2_packs.py, server/tilepack.py from BeamNG.Earth dev)"
+        run: |
+          mkdir -p tools server
+          curl -sfL -o tools/build_s2_packs.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/tools/build_s2_packs.py
+          curl -sfL -o server/tilepack.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/server/tilepack.py
+      - name: Build and upload each region
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          for r in ${{ matrix.chunk }}; do
+            x=${r%,*}; y=${r#*,}
+            rm -rf out && mkdir out
+            python tools/build_s2_packs.py out --zoom 12 --z5 "$x" "$y" --workers 6
+            aws s3 cp out "s3://$BUCKET/$PREFIX" --recursive --endpoint-url "$R2" --only-show-errors \
+              --content-type application/octet-stream --cache-control "public, max-age=2592000, immutable"
+          done
+
+  coarse:
+    needs: regions
+    if: ${{ always() && github.event.inputs.coarse == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy pillow
+      - run: |
+          mkdir -p tools server
+          curl -sfL -o tools/build_s2_packs.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/tools/build_s2_packs.py
+          curl -sfL -o server/tilepack.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/server/tilepack.py
+      - name: "Zooms 7..3 from the zoom-8 packs"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          mkdir -p out
+          aws s3 cp "s3://$BUCKET/$PREFIX/8" out/8 --recursive --endpoint-url "$R2" --only-show-errors
+          for z in 7 6 5 4 3; do
+            python tools/build_s2_packs.py out --zoom $z --bbox -85 -180 85 180 --down --workers 4
+          done
+          for z in 7 6 5 4 3; do
+            aws s3 cp out/$z "s3://$BUCKET/$PREFIX/$z" --recursive --endpoint-url "$R2" --only-show-errors \
+              --content-type application/octet-stream --cache-control "public, max-age=2592000, immutable"
+          done
