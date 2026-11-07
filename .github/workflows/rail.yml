@@ -123,11 +123,17 @@ jobs:
         with:
           path: parts
       - name: Site
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p site
           cp -r parts/rail/* site/
           cp -r parts/lanes/* site/
           if [ -d parts/signs ]; then cp -r parts/signs/* site/; fi
+          # PR #505's regional scenery data (BeamNG.Earth tools/build_regional_data.py): static, from this repo's
+          # release "regional-data" (asset regional.tar), unpacked as site/regional (optional: without it the rest publishes)
+          if gh release download regional-data -R "$GITHUB_REPOSITORY" -p regional.tar -D parts 2>/dev/null; then
+            mkdir -p site/regional && tar xf parts/regional.tar -C site/regional; fi
           cp README.md site/
           printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>, lane-level road tags: <a href="lanes/manifest.json">lanes/manifest.json</a>, highway sign sources: <a href="signs/manifest.json">signs/manifest.json</a>, level crossings (US): <a href="fra/manifest.json">fra/manifest.json</a>. Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
           ls site
