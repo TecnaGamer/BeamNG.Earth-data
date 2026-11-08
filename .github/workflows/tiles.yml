@@ -1,7 +1,7 @@
 # BeamNG.Earth's own tile host (Cloudflare R2 behind its CDN, bucket bnge-tiles): Sentinel-2 photo packs of the whole
 # land (server/tilepack.py, imagery source "bngs2"), built from ESA WorldCover's 2021 Sentinel-2 RGBNIR composite
-# (CC BY 4.0, "Contains modified Copernicus Sentinel data 2021") by tools/build_s2_packs.py from BeamNG.Earth's dev
-# branch. Manual only: Actions -> tiles -> Run workflow. Players use the packs only when cdn.json (this repo) turns
+# (CC BY 4.0, "Contains modified Copernicus Sentinel data 2021") by tools/build_s2_packs.py (a copy from BeamNG.Earth,
+# in this repo). Manual only: Actions -> tiles -> Run workflow. Players use the packs only when cdn.json (this repo) turns
 # "bngs2" on.
 #   regions: "all" (every zoom-5 tile with land) or a list "x,y x,y" of zoom-5 tiles
 #   coarse: also build zooms 7..3 from the zoom-8 packs in the bucket (after the regions)
@@ -83,11 +83,10 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install numpy pillow
-      - name: "The builder (tools/build_s2_packs.py, server/tilepack.py from BeamNG.Earth dev)"
+      - uses: actions/checkout@v4
+      - name: "The builder (tools/build_s2_packs.py, server/tilepack.py: copies from BeamNG.Earth in this repo)"
         run: |
-          mkdir -p tools server
-          curl -sfL -o tools/build_s2_packs.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/tools/build_s2_packs.py
-          curl -sfL -o server/tilepack.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/server/tilepack.py
+          test -f tools/build_s2_packs.py && test -f server/tilepack.py
       - name: Build and upload each region
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -113,10 +112,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install numpy pillow
+      - uses: actions/checkout@v4
       - run: |
-          mkdir -p tools server
-          curl -sfL -o tools/build_s2_packs.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/tools/build_s2_packs.py
-          curl -sfL -o server/tilepack.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/server/tilepack.py
+          test -f tools/build_s2_packs.py && test -f server/tilepack.py
       - name: "Zooms 7..3 from the zoom-8 packs"
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
