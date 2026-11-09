@@ -32,3 +32,11 @@ https://www.openstreetmap.org/copyright.
 `fra/<x>/<y>.json.gz` per zoom-7 tile: the US Federal Railroad Administration's Highway-Rail Crossing Inventory, its
 open at-grade crossings as `[lat, lon, kit]` (kit: `gate`, `flash` or `cross`), built by `tools/build_fra_shards.py`.
 Public domain (a work of the US government).
+
+## addons.json: the in-game Add-ons page's list (edited by hand)
+The add-ons BeamNG.Earth's Add-ons page offers and lets players install (server/addons.py, REGISTRY_URL; read through
+raw.githubusercontent.com, not the Pages site, so editing it needs no data build). Every edit reaches players within a
+few hours, with no release in between: treat a change here like a release. Only list a repo whose author agreed and
+whose files were checked first. A file that can't be read, or whose entries are all invalid, leaves players on the list
+bundled with their version; an empty `addons` list takes every add-on off. The format is in BeamNG.Earth's
+docs/ADDONS.md.
