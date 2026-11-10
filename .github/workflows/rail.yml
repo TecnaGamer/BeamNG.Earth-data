@@ -138,9 +138,13 @@ jobs:
           # static, from this repo's release "lod2-data" (asset lod2.tar, holding lod2/), unpacked as site/lod2 (optional)
           if gh release download lod2-data -R "$GITHUB_REPOSITORY" -p lod2.tar -D parts 2>/dev/null; then
             tar xf parts/lod2.tar -C site; rm -f parts/lod2.tar; fi
+          # New York's measured building massing (BeamNG.Earth tools/build_nyc_massing.py from NYC Open Data's 2014 3-D
+          # Building Model): static, from this repo's release "nycmassing-data" (asset nycmassing.tar, holding nycmassing/)
+          if gh release download nycmassing-data -R "$GITHUB_REPOSITORY" -p nycmassing.tar -D parts 2>/dev/null; then
+            tar xf parts/nycmassing.tar -C site; rm -f parts/nycmassing.tar; fi
           du -sh site; du -sh site/* | sort -h | tail -8
           cp README.md site/
-          printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>, lane-level road tags: <a href="lanes/manifest.json">lanes/manifest.json</a>, highway sign sources: <a href="signs/manifest.json">signs/manifest.json</a>, level crossings (US): <a href="fra/manifest.json">fra/manifest.json</a>, measured German roofs: <a href="lod2/manifest.json">lod2/manifest.json</a> (sources and licences: <a href="lod2/ATTRIBUTION.md">lod2/ATTRIBUTION.md</a>). Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
+          printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>, lane-level road tags: <a href="lanes/manifest.json">lanes/manifest.json</a>, highway sign sources: <a href="signs/manifest.json">signs/manifest.json</a>, level crossings (US): <a href="fra/manifest.json">fra/manifest.json</a>, measured German roofs: <a href="lod2/manifest.json">lod2/manifest.json</a> (sources and licences: <a href="lod2/ATTRIBUTION.md">lod2/ATTRIBUTION.md</a>), New York building massing: <a href="nycmassing/v1/manifest.json">nycmassing/v1/manifest.json</a> (<a href="nycmassing/ATTRIBUTION.md">nycmassing/ATTRIBUTION.md</a>). Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
           ls site
       - uses: actions/upload-pages-artifact@v3
         with:
