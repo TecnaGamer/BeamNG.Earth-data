@@ -112,8 +112,36 @@ jobs:
           path: out
           retention-days: 3
 
+  stations:
+    # OpenStreetMap's fuel and charging stations with their capacity, and the charge points (stations/, read by
+    # BeamNG.Earth's server/railtags.py StationTags: the station finder's map everywhere, EV chargers' real counts and
+    # spots). Optional like the signs: a failed job leaves it out and the rest still publishes.
+    needs: planet
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tools
+        run: pip install "osmium==4.3.2" numpy
+      - name: "The builder (tools/build_station_tags.py from BeamNG.Earth, with build_rail_tags.py it uses)"
+        run: |
+          B=https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev
+          curl -sfL -o build_rail_tags.py "$B/tools/build_rail_tags.py"
+          curl -sfL -o build_station_tags.py "$B/tools/build_station_tags.py"
+      - name: Build
+        run: |
+          python build_station_tags.py "${{ needs.planet.outputs.url }}" out/stations
+          echo "${{ needs.planet.outputs.url }}" > out/stations/planet.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stations
+          path: out
+          retention-days: 3
+
   site:
-    needs: [rail, lanes, signs]
+    needs: [rail, lanes, signs, stations]
     # (the sign shards are optional: a failed signs job leaves them out, the rail and lane data still publish)
     if: ${{ !cancelled() && needs.rail.result == 'success' && needs.lanes.result == 'success' }}
     runs-on: ubuntu-latest
@@ -130,6 +158,7 @@ jobs:
           cp -r parts/rail/* site/
           cp -r parts/lanes/* site/
           if [ -d parts/signs ]; then cp -r parts/signs/* site/; fi
+          if [ -d parts/stations ]; then cp -r parts/stations/* site/; fi
           # PR #505's regional scenery data (BeamNG.Earth tools/build_regional_data.py): static, from this repo's
           # release "regional-data" (asset regional.tar), unpacked as site/regional (optional: without it the rest publishes)
           if gh release download regional-data -R "$GITHUB_REPOSITORY" -p regional.tar -D parts 2>/dev/null; then
@@ -148,7 +177,7 @@ jobs:
             tar xf parts/lod2more.tar -C site; rm -f parts/lod2more.tar; fi
           du -sh site; du -sh site/* | sort -h | tail -8
           cp README.md site/
-          printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>, lane-level road tags: <a href="lanes/manifest.json">lanes/manifest.json</a>, highway sign sources: <a href="signs/manifest.json">signs/manifest.json</a>, level crossings (US): <a href="fra/manifest.json">fra/manifest.json</a>, measured German roofs: <a href="lod2/manifest.json">lod2/manifest.json</a> (sources and licences: <a href="lod2/ATTRIBUTION.md">lod2/ATTRIBUTION.md</a>), measured roofs of Switzerland, Estonia and Vienna: <a href="lod2-ch/ATTRIBUTION.md">lod2-ch</a>, <a href="lod2-ee/ATTRIBUTION.md">lod2-ee</a>, <a href="lod2-wien/ATTRIBUTION.md">lod2-wien</a>, New York building massing: <a href="nycmassing/v1/manifest.json">nycmassing/v1/manifest.json</a> (<a href="nycmassing/ATTRIBUTION.md">nycmassing/ATTRIBUTION.md</a>). Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
+          printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>, lane-level road tags: <a href="lanes/manifest.json">lanes/manifest.json</a>, highway sign sources: <a href="signs/manifest.json">signs/manifest.json</a>, fuel and charging stations: <a href="stations/manifest.json">stations/manifest.json</a>, level crossings (US): <a href="fra/manifest.json">fra/manifest.json</a>, measured German roofs: <a href="lod2/manifest.json">lod2/manifest.json</a> (sources and licences: <a href="lod2/ATTRIBUTION.md">lod2/ATTRIBUTION.md</a>), measured roofs of Switzerland, Estonia and Vienna: <a href="lod2-ch/ATTRIBUTION.md">lod2-ch</a>, <a href="lod2-ee/ATTRIBUTION.md">lod2-ee</a>, <a href="lod2-wien/ATTRIBUTION.md">lod2-wien</a>, New York building massing: <a href="nycmassing/v1/manifest.json">nycmassing/v1/manifest.json</a> (<a href="nycmassing/ATTRIBUTION.md">nycmassing/ATTRIBUTION.md</a>). Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
           ls site
       - uses: actions/upload-pages-artifact@v3
         with:

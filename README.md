@@ -27,6 +27,18 @@ paint the road markings lane by lane and give the traffic the same lanes. Built 
 [Open Database License 1.0](https://opendatacommons.org/licenses/odbl/1-0/). See
 https://www.openstreetmap.org/copyright.
 
+## stations/: OpenStreetMap's fuel and charging stations (weekly)
+
+`stations/<x>/<y>.json.gz` per zoom-7 tile: every `amenity=fuel` and `amenity=charging_station` (a node, or a way's
+centre) with its name, brand (or operator / network) and, for chargers, `capacity`, and every `man_made=charge_point`
+node. BeamNG.Earth's station finder lists them on its world map where no map data is downloaded, and its EV charger
+sites take their real charger count and spots from them (`server/railtags.py` StationTags). Built by the same workflow
+with `tools/build_station_tags.py`.
+
+**License:** the data is © OpenStreetMap contributors, available under the
+[Open Database License 1.0](https://opendatacommons.org/licenses/odbl/1-0/). See
+https://www.openstreetmap.org/copyright.
+
 ## fra/: US level crossings (weekly)
 
 `fra/<x>/<y>.json.gz` per zoom-7 tile: the US Federal Railroad Administration's Highway-Rail Crossing Inventory, its
