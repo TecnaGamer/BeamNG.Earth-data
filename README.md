@@ -33,6 +33,14 @@ https://www.openstreetmap.org/copyright.
 open at-grade crossings as `[lat, lon, kit]` (kit: `gate`, `flash` or `cross`), built by `tools/build_fra_shards.py`.
 Public domain (a work of the US government).
 
+## lod2/: Germany's measured roofs (static, release "lod2-data")
+
+`lod2/<x>/<y>.npz` per zoom-10 tile: one record per building part from the German states' open LoD2 building models
+(`lat`, `lon` int32 in 1e-6 degrees, `code` int16 AdV roof type, `height` and `roof` uint16 decimetres), built by
+BeamNG.Earth's `tools/build_lod2_roofs.py` (PR #872, Henner4746). 13 states, 65.3 million records; changed data under
+dl-de/by-2-0, dl-de/zero-2.0 and CC BY 4.0, with each state's attribution in `lod2/ATTRIBUTION.md`. The data
+workflow unpacks the release's `lod2.tar` into the site.
+
 ## addons.json: the in-game Add-ons page's list (edited by hand)
 The add-ons BeamNG.Earth's Add-ons page offers and lets players install (server/addons.py, REGISTRY_URL; read through
 raw.githubusercontent.com, not the Pages site, so editing it needs no data build). Every edit reaches players within a
