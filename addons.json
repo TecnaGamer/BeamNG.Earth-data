@@ -22,6 +22,39 @@
       "trust": "latest",
       "reviewed": [],
       "minEarth": "1.8.0"
+    },
+    {
+      "id": "live-gps",
+      "name": "BeamNG.Earth Live GPS",
+      "author": "Leopri2008",
+      "repo": "Leopri2008/BeamNG.Earth-LiveGPS",
+      "kind": "companion",
+      "summary": "Your Android phone's GPS follows your car, so Google Maps or Waze track your drive; plus a live map with search, navigation and fuel prices in any browser, a drive recorder and a fog-of-the-world map.",
+      "licence": "All rights reserved: free for personal use; no redistribution.",
+      "asset": "^bne_live_coords.*\\.py$",
+      "links": [
+        {
+          "label": "Android app (APK)",
+          "asset": "^BNE-Mock-GPS.*\\.apk$"
+        }
+      ],
+      "note": "A program that runs beside the game. Its live map is served on your Wi-Fi (port 47700) without a login, so other devices and web pages can read your car's position and trips while it runs. It looks up the street you're on with OpenStreetMap's Nominatim as you drive (turn off with its --no-places option). The Android app needs \"Select mock location app\" in the phone's developer options.",
+      "trust": "latest",
+      "reviewed": [
+        {
+          "tag": "v2.0",
+          "sha256": "bfd770a8491690780e5c005f856c023d2feb59b17da3db7fc96fbd29d601f39b"
+        }
+      ],
+      "run": {
+        "args": [
+          "--feed"
+        ],
+        "page": "http://127.0.0.1:47700/map",
+        "port": 47700,
+        "lan": true
+      },
+      "minEarth": "1.9.0"
     }
   ]
 }
