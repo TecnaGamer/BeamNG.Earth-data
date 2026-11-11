@@ -215,6 +215,9 @@ jobs:
 
   deploy:
     needs: site
+    # (an optional job's failure upstream (osmtags, signs) must not hold the site back: by default a job is skipped
+    # when anything before it failed, and the 2026-11-11 run built the site and never deployed it)
+    if: ${{ !cancelled() && needs.site.result == 'success' }}
     runs-on: ubuntu-latest
     environment:
       name: github-pages
