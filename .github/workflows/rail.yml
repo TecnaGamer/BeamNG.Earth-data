@@ -112,9 +112,58 @@ jobs:
           path: out
           retention-days: 3
 
+  osmtags:
+    # OpenStreetMap's road tags (lanes, width, speed limit, sidewalk, surface ...) of OSM US's Layercake highways file,
+    # one blob per zoom-12 tile in one PMTiles archive (BeamNG.Earth tools/build_osm_tag_shards.py; a copy in this
+    # repo, as the tiles workflow's builder: this job holds the R2 secrets, so it runs no code fetched from elsewhere).
+    # The archive (~2.5 GB, over Pages' 1 GB) goes to the tile host (R2 behind tiles.tgforever.net) under a key of its
+    # own build, never overwritten; only the manifest is published on Pages, pointing at it. Optional: without it the
+    # server reads the Layercake file as before.
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tools
+        run: pip install "duckdb==1.5.6" numpy
+      - name: Build
+        run: |
+          sudo mkdir -p /mnt/otg && sudo chown "$USER" /mnt/otg
+          python tools/build_osm_tag_shards.py https://data.openstreetmap.us/layercake/highways.parquet \
+            /mnt/otg/out/osmtags --workers 4 --tmp /mnt/otg/tmp
+          rm -rf /mnt/otg/tmp
+      - name: The archive to the tile host, the manifest pointing at it
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          D=/mnt/otg/out/osmtags
+          KEY=$(python -c "import json, re; print(re.sub(r'[^0-9A-Za-z]+', '_', json.load(open('$D/manifest.json'))['built']))")
+          aws s3 cp "$D/osmtags.pmtiles" "s3://bnge-tiles/osmtags/$KEY/osmtags.pmtiles" --endpoint-url "$R2" \
+            --only-show-errors --content-type application/octet-stream --cache-control "public, max-age=31536000, immutable"
+          python - "$D/manifest.json" "https://tiles.tgforever.net/osmtags/$KEY/osmtags.pmtiles" <<'PY'
+          import json, sys
+          m = json.load(open(sys.argv[1]))
+          m["archive"] = sys.argv[2]
+          json.dump(m, open(sys.argv[1], "w"), separators=(",", ":"))
+          PY
+          rm "$D/osmtags.pmtiles"
+          mkdir -p out && cp -r "$D" out/
+          cat out/osmtags/manifest.json | head -c 400; echo
+      - uses: actions/upload-artifact@v4
+        with:
+          name: osmtags
+          path: out
+          retention-days: 3
+
   site:
-    needs: [rail, lanes, signs]
-    # (the sign shards are optional: a failed signs job leaves them out, the rail and lane data still publish)
+    needs: [rail, lanes, signs, osmtags]
+    # (the sign shards and the OSM road tags are optional: a failed signs / osmtags job leaves them out, the rail and
+    # lane data still publish)
     if: ${{ !cancelled() && needs.rail.result == 'success' && needs.lanes.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
@@ -130,6 +179,7 @@ jobs:
           cp -r parts/rail/* site/
           cp -r parts/lanes/* site/
           if [ -d parts/signs ]; then cp -r parts/signs/* site/; fi
+          if [ -d parts/osmtags ]; then cp -r parts/osmtags/* site/; fi
           # PR #505's regional scenery data (BeamNG.Earth tools/build_regional_data.py): static, from this repo's
           # release "regional-data" (asset regional.tar), unpacked as site/regional (optional: without it the rest publishes)
           if gh release download regional-data -R "$GITHUB_REPOSITORY" -p regional.tar -D parts 2>/dev/null; then
