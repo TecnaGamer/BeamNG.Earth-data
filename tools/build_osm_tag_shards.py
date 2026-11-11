@@ -373,7 +373,7 @@ def write_pmtiles(path, entries, data_path, bounds, n_rows, z=SHARD_ZOOM, root_m
 # ------------------------------------------------------------------------------------------------ the source
 _CON = None
 DUCKDB_MEMORY = "1500MB"        # a decode worker's DuckDB buffer pool at most
-DECODE_TASKS = 25               # row groups a decode worker takes before a fresh process replaces it (its memory back)
+DECODE_TASKS = 25               # row groups a decode worker takes before fresh processes replace it (its memory back)
 
 
 def _connect(threads=2):
@@ -382,7 +382,7 @@ def _connect(threads=2):
     # (no cache of the remote file's bytes, a capped buffer pool: one connection per decode worker for its whole life
     # grew the planet build's memory ~1 GB every 2 min to the runner's 16 GB, and the runner was stopped, 2026-11-11)
     for sql in ("LOAD httpfs", "SET enable_http_metadata_cache = true", "SET parquet_metadata_cache = true",
-                "SET enable_geoparquet_conversion = false", "SET enable_external_file_cache = false",
+                "SET enable_geoparquet_conversion = false", "SET enable_progress_bar = false", "SET enable_external_file_cache = false",
                 f"SET memory_limit = '{DUCKDB_MEMORY}'"):
         try:
             con.execute(sql)
@@ -672,15 +672,19 @@ def build(src, out, bbox=None, workers=4, tmp=None, log=print, z=SHARD_ZOOM, roo
             clip = tuple(int(v[0]) for v in tile_ranges(*(np.array([v], np.float32) for v in bbox), z))
         paths, done, coarse, races = {}, 0, {}, []
         jobs = [(src, rg, first, n, tmp, z, cz, clip) for rg, first, n, _ in groups]
-        with ProcessPoolExecutor(workers, max_tasks_per_child=DECODE_TASKS) as ex:
-            for rg, n, path, areas, rr in ex.map(decode_group, jobs):
-                paths[rg] = path
-                for a in areas:
-                    coarse.setdefault(a, set()).add(rg)
-                races += rr
-                done += 1
-                if done % 50 == 0 or done == len(jobs):
-                    log(f"  decoded {done}/{len(jobs)} row groups, {time.time() - t0:.0f} s")
+        # (a fresh pool per chunk of DECODE_TASKS row groups a worker: max_tasks_per_child hung the planet build for good
+        # right after its first workers were replaced, "decoded 50/2477" then 5 h of nothing, 2026-11-11)
+        chunk = max(1, workers * DECODE_TASKS)
+        for c0 in range(0, len(jobs), chunk):
+            with ProcessPoolExecutor(workers) as ex:
+                for rg, n, path, areas, rr in ex.map(decode_group, jobs[c0:c0 + chunk]):
+                    paths[rg] = path
+                    for a in areas:
+                        coarse.setdefault(a, set()).add(rg)
+                    races += rr
+                    done += 1
+                    if done % 50 == 0 or done == len(jobs):
+                        log(f"  decoded {done}/{len(jobs)} row groups, {time.time() - t0:.0f} s")
         if etag_of(src) != etag0:
             raise SystemExit(f"{src} changed during the build ({etag0} -> {etag_of(src)})")
         # the raceways inside each raceway's bbox (osmtags._inside_rows, file-wide; float32 comparisons)
