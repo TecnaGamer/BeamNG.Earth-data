@@ -59,6 +59,14 @@ BeamNG.Earth's `tools/build_lod2_roofs.py` (PR #872, Henner4746). 13 states, 65.
 dl-de/by-2-0, dl-de/zero-2.0 and CC BY 4.0, with each state's attribution in `lod2/ATTRIBUTION.md`. The data
 workflow unpacks the release's `lod2.tar` into the site.
 
+## deroads/: Germany's surveyed roads (static, release "deroads-data")
+
+`deroads/<x>/<y>.npz` per zoom-10 tile: the German states' official road axes (ATKIS Basis-DLM, from basemap.de's
+GeoPackages) with their surveyed width, lane count and surface, built by BeamNG.Earth's `tools/build_de_roads.py`
+(PR #1036, Henner4746). All 16 states, 684 shards, 216 MB; under dl-de/by-2-0, dl-de/zero-2.0 and CC BY 4.0, with
+each state's attribution in `deroads/ATTRIBUTION.md`. The data workflow unpacks this repo's release `deroads.tar`, or,
+until there is one, the release on Henner4746's fork whose SHA-256 the workflow pins.
+
 ## dem/mapterhorn/: Mapterhorn's elevation tiles z0-12 (tile host only, workflow "dem")
 
 [Mapterhorn](https://mapterhorn.com/attribution)'s `planet.pmtiles` (z0-12, terrarium WebP; data from many open
