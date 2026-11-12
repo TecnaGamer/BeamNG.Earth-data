@@ -127,7 +127,7 @@ jobs:
           CHUNK: ${{ matrix.chunk }}
           ZOOM: ${{ github.event.inputs.zoom }}
           MAX_LAT: ${{ github.event.inputs.max_lat }}
-          S2_BLOCK_CACHE: "700"     # decoded source blocks kept (~6 MB each): a pack row's blocks for the next row
+          S2_BLOCK_CACHE: "900"     # decoded source blocks kept (~6 MB each): a pack row's blocks for the next row
         run: |
           Z=${ZOOM:-12}
           CP=(--endpoint-url "$R2" --only-show-errors)
@@ -169,7 +169,7 @@ jobs:
             echo "region $x,$y: $before packs in the bucket already"
             set +e
             python tools/build_s2_packs.py out --zoom "$Z" --min-zoom "$Z" --z5 "$x" "$y" --format webp \
-              --skip skip.txt --deadline "$DEADLINE" --workers 12 "${LAT[@]}"
+              --skip skip.txt --deadline "$DEADLINE" --workers 20 "${LAT[@]}"
             st=$?
             set -e
             n=$(find out -name '*.bngp' | wc -l)
