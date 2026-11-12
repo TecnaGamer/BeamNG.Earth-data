@@ -163,7 +163,8 @@ jobs:
             for ((i = 0; i < (1 << d); i++)); do
               px=$(( (x << d) + i ))
               aws s3 ls "s3://$BUCKET/$PREFIX/$Z/$px/" --endpoint-url "$R2" 2>/dev/null \
-                | awk -v p="$Z/$px/" '$4 ~ /\.bngp$/ {print p $4}' >> skip.txt || true
+                | awk -v p="$Z/$px/" -v y0=$(( y << d )) -v y1=$(( (y + 1) << d )) \
+                    '$4 ~ /\.bngp$/ && $4 + 0 >= y0 && $4 + 0 < y1 {print p $4}' >> skip.txt || true
             done
             before=$(wc -l < skip.txt)
             echo "region $x,$y: $before packs in the bucket already"
