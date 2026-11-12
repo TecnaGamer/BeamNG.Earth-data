@@ -4,6 +4,12 @@ Data files that [BeamNG.Earth](https://github.com/TecnaGamer/BeamNG.Earth) reads
 by this repository's GitHub Actions and served by its GitHub Pages
 (`https://tecnagamer.github.io/BeamNG.Earth-data/`).
 
+Each dataset's files are also copied to the project's tile host (Cloudflare R2 behind
+`https://tiles.tgforever.net`, `data/<dataset>/<build key>/`, the same paths; `tools/mirror_data.py`), and the
+dataset's `manifest.json` on Pages names that copy in its `"data"` field: BeamNG.Earth reads the files there and
+falls back to Pages. The OSM road tag archive (`osmtags/`) is on the tile host only, in parts of at most 400 MB that
+the manifest's `"parts"` list.
+
 ## rail/: OpenStreetMap's railways (weekly)
 
 `rail/<x>/<y>.json.gz` per zoom-7 tile with railways: OpenStreetMap's railway tags by way id (railway, usage,
