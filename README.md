@@ -59,6 +59,14 @@ BeamNG.Earth's `tools/build_lod2_roofs.py` (PR #872, Henner4746). 13 states, 65.
 dl-de/by-2-0, dl-de/zero-2.0 and CC BY 4.0, with each state's attribution in `lod2/ATTRIBUTION.md`. The data
 workflow unpacks the release's `lod2.tar` into the site.
 
+## dem/mapterhorn/: Mapterhorn's elevation tiles z0-12 (tile host only, workflow "dem")
+
+[Mapterhorn](https://mapterhorn.com/attribution)'s `planet.pmtiles` (z0-12, terrarium WebP; data from many open
+sources, see that page) repacked as it is into packs of 8 x 8 tiles (`server/tilepack.py`) by
+`tools/build_mt_packs.py`, under `dem/mapterhorn/<release>/{z}/{px}/{py}.bngp` with `index.bin` (which packs exist)
+and `release.json`. Mapterhorn allows storing and redistributing its tiles with attribution; BeamNG.Earth reads them
+for zooms 0-12 when `cdn.json` turns `"dem"` -> `"bngmt"` on, and asks tiles.mapterhorn.com only for deeper zooms.
+
 ## addons.json: the in-game Add-ons page's list (edited by hand)
 The add-ons BeamNG.Earth's Add-ons page offers and lets players install (server/addons.py, REGISTRY_URL; read through
 raw.githubusercontent.com, not the Pages site, so editing it needs no data build). Every edit reaches players within a

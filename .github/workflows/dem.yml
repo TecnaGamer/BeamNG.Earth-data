@@ -1,0 +1,230 @@
+# Mapterhorn's elevation tiles z0-12 on BeamNG.Earth's own tile host (Cloudflare R2 behind its CDN, bucket bnge-tiles),
+# for the server's DEM source "bngmt" (server/dem.py MT_CDN_*): Mapterhorn's planet.pmtiles (z0-12, 331 GiB) repacked
+# by tools/build_mt_packs.py (a copy from BeamNG.Earth) into packs of 8 x 8 tiles (server/tilepack.py), the tiles' bytes
+# unchanged, under dem/mapterhorn/<release>/{z}/{px}/{py}.bngp. Mapterhorn (https://mapterhorn.com/attribution, data
+# from many open sources) allows storing and redistributing its tiles with attribution; its maintainer asked apps to use
+# the archives instead of the tile endpoint (players asked tiles.mapterhorn.com 53 M times a day, 2026-11-11).
+# Manual only: Actions -> dem -> Run workflow. Players use the packs only when cdn.json (this repo) turns "dem" ->
+# "bngmt" on with this release.
+#
+# The archive is never stored: the plan job reads its directories (~21 MB) and cuts its tile ids into SHARDS runs of
+# about equal bytes (each one run of the archive's bytes: it is clustered); each shard job reads its run by range reads
+# (If-Match the archive's ETag: a changed archive fails instead of mixing releases), writes its packs and uploads them,
+# then a marker (_build/<shards>/done/<i>.json). Resumable: a shard with a marker is skipped by later runs (run the
+# workflow again with the same inputs). The verify job streams the whole archive through MD5 against Mapterhorn's
+# download_urls.json. finalize writes index.bin (which packs exist; the server uses a release only with it) and
+# release.json, only when every shard is done and the MD5 matched.
+#   release: Mapterhorn's release (download_urls.json "version"); the run stops if Mapterhorn lists another
+#   shards: how many shard jobs (keep it the same across the runs of one release: the markers are per count)
+#   only: blank for all, else shard numbers "0 1 2" (a trial)
+#   verify / finalize: true / false
+# Secrets (repo settings): R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY (an R2 token: Object Read & Write,
+# this bucket only).
+name: dem
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Mapterhorn's release (download_urls.json version)"
+        default: "0.0.13"
+      shards:
+        description: "shard jobs (the same for every run of a release)"
+        default: "128"
+      only:
+        description: 'blank: every shard; else shard numbers "0 1 2"'
+        default: ""
+      verify:
+        description: "stream the archive through MD5 (true/false)"
+        default: "true"
+      finalize:
+        description: "write index.bin once every shard is done and the MD5 matched (true/false)"
+        default: "true"
+      source:
+        description: "the archive's URL"
+        default: "https://data.source.coop/mapterhorn/mapterhorn/planet.pmtiles"
+
+permissions:
+  contents: read
+
+env:
+  BUCKET: bnge-tiles
+  AWS_DEFAULT_REGION: auto
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (R2 and aws-cli 2.23+'s default checksums: rail.yml)
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+      etag: ${{ steps.plan.outputs.etag }}
+      md5: ${{ steps.plan.outputs.md5 }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/checkout@v4
+      - id: plan
+        name: "Mapterhorn's file list (release, MD5, size), the archive's directories, the shards"
+        env:
+          RELEASE: ${{ github.event.inputs.release }}
+          SHARDS: ${{ github.event.inputs.shards }}
+          ONLY: ${{ github.event.inputs.only }}
+          SOURCE: ${{ github.event.inputs.source }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad release: $RELEASE"; exit 1; }
+          [[ "$SHARDS" =~ ^[0-9]+$ ]] && [ "$SHARDS" -ge 1 ] && [ "$SHARDS" -le 250 ] || { echo "bad shards: $SHARDS"; exit 1; }
+          [[ "$ONLY" =~ ^[0-9\ ]*$ ]] || { echo "bad only: $ONLY"; exit 1; }
+          curl -sfL --retry 5 https://download.mapterhorn.com/download_urls.json -o urls.json
+          python tools/build_mt_packs.py --source "$SOURCE" plan --shards "$SHARDS" > plan.json
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          urls = json.load(open("urls.json"))
+          plan = json.load(open("plan.json"))
+          if str(urls.get("version")) != os.environ["RELEASE"]:
+              raise SystemExit(f"Mapterhorn lists release {urls.get('version')}, not {os.environ['RELEASE']}")
+          planet = next(i for i in urls["items"] if i["name"] == "planet.pmtiles")
+          if int(planet["size"]) != plan["size"]:
+              raise SystemExit(f"archive size {plan['size']}, Mapterhorn lists {planet['size']}")
+          only = {int(v) for v in os.environ.get("ONLY", "").split()}
+          shards = [f"{i} {t0} {t1}" for i, (t0, t1) in enumerate(plan["shards"]) if not only or i in only]
+          print("shards=" + json.dumps(shards))
+          print("etag=" + plan["etag"])
+          print("md5=" + planet["md5sum"])
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"{plan['packs']} packs with stored tiles, {plan['bytes'] / 1e9:.1f} GB, {len(plan['shards'])} "
+                      f"shards ({len(shards)} in this run), ETag {plan['etag']}, MD5 {planet['md5sum']}\n")
+          PY
+        shell: bash
+
+  shards:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/checkout@v4
+      - name: Build and upload the shard's packs
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          SHARD: ${{ matrix.shard }}
+          ETAG: ${{ needs.plan.outputs.etag }}
+          RELEASE: ${{ github.event.inputs.release }}
+          SHARDS: ${{ github.event.inputs.shards }}
+          SOURCE: ${{ github.event.inputs.source }}
+        run: |
+          set -euo pipefail
+          read -r i t0 t1 <<< "$SHARD"
+          PREFIX="dem/mapterhorn/$RELEASE"
+          MARK="$PREFIX/_build/$SHARDS/done/$i.json"
+          if aws s3 ls "s3://$BUCKET/$MARK" --endpoint-url "$R2" >/dev/null 2>&1; then
+            echo "shard $i: done before"; exit 0
+          fi
+          DEADLINE=$(( $(date +%s) + 270 * 60 ))
+          set +e
+          python tools/build_mt_packs.py --source "$SOURCE" build out --range "$t0" "$t1" --etag "$ETAG" \
+            --workers 12 --deadline "$DEADLINE" | tee build.log
+          st=${PIPESTATUS[0]}
+          set -e
+          n=$(find out -name '*.bngp' 2>/dev/null | wc -l)
+          mb=$(du -sm out 2>/dev/null | cut -f1 || echo 0)
+          if [ "$n" -gt 0 ]; then
+            aws s3 cp out "s3://$BUCKET/$PREFIX" --recursive --exclude "*.tmp" --endpoint-url "$R2" --only-show-errors \
+              --content-type application/octet-stream --cache-control "public, max-age=2592000, immutable"
+          fi
+          echo "shard $i ($t0..$t1): status $st, $n packs uploaded ($mb MB)" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$st" -ne 0 ]; then
+            echo "::warning::shard $i: builder status $st (run the workflow again for the rest)"
+            exit 1
+          fi
+          printf '{"shard": %d, "range": [%d, %d], "packs": %d, "mb": %d, "etag": %s, "built": "%s"}\n' \
+            "$i" "$t0" "$t1" "$n" "$mb" "$(python3 -c 'import json, os; print(json.dumps(os.environ["ETAG"]))')" \
+            "$(date -u +%FT%TZ)" > done.json
+          aws s3 cp done.json "s3://$BUCKET/$MARK" --endpoint-url "$R2" --only-show-errors --content-type application/json
+
+  verify:
+    needs: plan
+    if: ${{ github.event.inputs.verify == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/checkout@v4
+      - name: "The whole archive through MD5 (Mapterhorn's download_urls.json)"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          ETAG: ${{ needs.plan.outputs.etag }}
+          MD5: ${{ needs.plan.outputs.md5 }}
+          RELEASE: ${{ github.event.inputs.release }}
+          SOURCE: ${{ github.event.inputs.source }}
+        run: |
+          set -euo pipefail
+          MARK="dem/mapterhorn/$RELEASE/_build/md5.json"
+          if aws s3 cp "s3://$BUCKET/$MARK" md5.json --endpoint-url "$R2" --only-show-errors 2>/dev/null \
+              && python3 -c 'import json, os, sys; d = json.load(open("md5.json")); sys.exit(0 if d["md5"] == os.environ["MD5"] and d["etag"] == os.environ["ETAG"] else 1)'; then
+            echo "verified before: $(cat md5.json)" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0
+          fi
+          python tools/build_mt_packs.py --source "$SOURCE" md5 --expect "$MD5" --etag "$ETAG" | tee md5.log
+          tail -1 md5.log > md5.json
+          aws s3 cp md5.json "s3://$BUCKET/$MARK" --endpoint-url "$R2" --only-show-errors --content-type application/json
+          echo "MD5 $MD5 matched" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  finalize:
+    needs: [plan, shards, verify]
+    if: ${{ always() && github.event.inputs.finalize == 'true' && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/checkout@v4
+      - name: "index.bin and release.json, once every shard is done and the MD5 matched"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          ETAG: ${{ needs.plan.outputs.etag }}
+          MD5: ${{ needs.plan.outputs.md5 }}
+          RELEASE: ${{ github.event.inputs.release }}
+          SHARDS: ${{ github.event.inputs.shards }}
+          SOURCE: ${{ github.event.inputs.source }}
+        run: |
+          set -euo pipefail
+          PREFIX="dem/mapterhorn/$RELEASE"
+          aws s3 ls "s3://$BUCKET/$PREFIX/_build/$SHARDS/done/" --endpoint-url "$R2" | awk '{print $4}' | sed 's/\.json$//' | sort -n > done.txt || true
+          n=$(wc -l < done.txt)
+          echo "shards done: $n of $SHARDS" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$n" -ne "$SHARDS" ]; then
+            echo "not every shard is done: no index (run the workflow again with the same inputs)" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          aws s3 cp "s3://$BUCKET/$PREFIX/_build/md5.json" md5.json --endpoint-url "$R2" --only-show-errors
+          python3 -c 'import json, os, sys; d = json.load(open("md5.json")); sys.exit(0 if d["md5"] == os.environ["MD5"] and d["etag"] == os.environ["ETAG"] else "MD5 not verified for this archive")'
+          python tools/build_mt_packs.py --source "$SOURCE" index index.bin --etag "$ETAG" | tee index.log
+          python3 - <<'PY'
+          import json, os
+          idx = json.loads(open("index.log").read().strip().splitlines()[-1])
+          json.dump({"release": os.environ["RELEASE"], "source": os.environ["SOURCE"], "etag": os.environ["ETAG"],
+                     "md5": os.environ["MD5"], "packs": idx["packs"], "k": 3, "max_zoom": 12,
+                     "attribution": "https://mapterhorn.com/attribution"}, open("release.json", "w"))
+          PY
+          aws s3 cp index.bin "s3://$BUCKET/$PREFIX/index.bin" --endpoint-url "$R2" --only-show-errors \
+            --content-type application/octet-stream --cache-control "public, max-age=86400"
+          aws s3 cp release.json "s3://$BUCKET/$PREFIX/release.json" --endpoint-url "$R2" --only-show-errors \
+            --content-type application/json
+          echo "index.bin and release.json written: $(cat release.json)" | tee -a "$GITHUB_STEP_SUMMARY"
