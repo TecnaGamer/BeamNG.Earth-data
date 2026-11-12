@@ -251,9 +251,21 @@ jobs:
           # Vienna): static, from this repo's release "lod2-more-data" (asset lod2more.tar: lod2-ch/, lod2-ee/, lod2-wien/)
           if gh release download lod2-more-data -R "$GITHUB_REPOSITORY" -p lod2more.tar -D parts 2>/dev/null; then
             tar xf parts/lod2more.tar -C site; rm -f parts/lod2more.tar; fi
+          # BeamNG.Earth PR #1036's surveyed German roads (Henner4746, tools/build_de_roads.py from the states' ATKIS
+          # Basis-DLM via basemap.de): static, holding deroads/ (684 shards, 216 MB, each state's licence in
+          # deroads/ATTRIBUTION.md). From this repo's release "deroads-data" (asset deroads.tar) when there is one, else
+          # the release the PR names on Henner4746's fork, kept only when its SHA-256 is the one pinned here (optional:
+          # without it the rest publishes)
+          DEROADS_SHA=39bf31c73fc1106af0fb231bf9b29a21e7296e22333209b8777446e075f37325
+          if gh release download deroads-data -R "$GITHUB_REPOSITORY" -p deroads.tar -D parts 2>/dev/null; then
+            tar xf parts/deroads.tar -C site; rm -f parts/deroads.tar
+          elif gh release download de-roads-data-2026-11-09 -R Henner4746/BeamNG.Earth -p de-roads-16-states.tar               -D parts 2>/dev/null && echo "$DEROADS_SHA  parts/de-roads-16-states.tar" | sha256sum -c -; then
+            tar xf parts/de-roads-16-states.tar -C site; rm -f parts/de-roads-16-states.tar
+          else
+            rm -f parts/de-roads-16-states.tar; echo "deroads: not published this run"; fi
           du -sh site; du -sh site/* | sort -h | tail -8
           cp README.md site/
-          printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>, lane-level road tags: <a href="lanes/manifest.json">lanes/manifest.json</a>, highway sign sources: <a href="signs/manifest.json">signs/manifest.json</a>, fuel and charging stations: <a href="stations/manifest.json">stations/manifest.json</a>, level crossings (US): <a href="fra/manifest.json">fra/manifest.json</a>, measured German roofs: <a href="lod2/manifest.json">lod2/manifest.json</a> (sources and licences: <a href="lod2/ATTRIBUTION.md">lod2/ATTRIBUTION.md</a>), measured roofs of Switzerland, Estonia and Vienna: <a href="lod2-ch/ATTRIBUTION.md">lod2-ch</a>, <a href="lod2-ee/ATTRIBUTION.md">lod2-ee</a>, <a href="lod2-wien/ATTRIBUTION.md">lod2-wien</a>, New York building massing: <a href="nycmassing/v1/manifest.json">nycmassing/v1/manifest.json</a> (<a href="nycmassing/ATTRIBUTION.md">nycmassing/ATTRIBUTION.md</a>). Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
+          printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>, lane-level road tags: <a href="lanes/manifest.json">lanes/manifest.json</a>, highway sign sources: <a href="signs/manifest.json">signs/manifest.json</a>, fuel and charging stations: <a href="stations/manifest.json">stations/manifest.json</a>, level crossings (US): <a href="fra/manifest.json">fra/manifest.json</a>, measured German roofs: <a href="lod2/manifest.json">lod2/manifest.json</a> (sources and licences: <a href="lod2/ATTRIBUTION.md">lod2/ATTRIBUTION.md</a>), surveyed German roads: <a href="deroads/ATTRIBUTION.md">deroads/ATTRIBUTION.md</a>, measured roofs of Switzerland, Estonia and Vienna: <a href="lod2-ch/ATTRIBUTION.md">lod2-ch</a>, <a href="lod2-ee/ATTRIBUTION.md">lod2-ee</a>, <a href="lod2-wien/ATTRIBUTION.md">lod2-wien</a>, New York building massing: <a href="nycmassing/v1/manifest.json">nycmassing/v1/manifest.json</a> (<a href="nycmassing/ATTRIBUTION.md">nycmassing/ATTRIBUTION.md</a>). Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
           ls site
       - name: The datasets' files to the tile host, each manifest naming that copy ("data")
         # (players read ~1.15 TB a month of these from Pages, whose soft limit is 100 GB: BeamNG.Earth's server reads a
