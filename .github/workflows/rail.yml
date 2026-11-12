@@ -114,10 +114,11 @@ jobs:
 
   osmtags:
     # OpenStreetMap's road tags (lanes, width, speed limit, sidewalk, surface ...) of OSM US's Layercake highways file,
-    # one blob per zoom-12 tile in one PMTiles archive (BeamNG.Earth tools/build_osm_tag_shards.py; a copy in this
-    # repo, as the tiles workflow's builder: this job holds the R2 secrets, so it runs no code fetched from elsewhere).
-    # The archive (~2.5 GB, over Pages' 1 GB) goes to the tile host (R2 behind tiles.tgforever.net) under a key of its
-    # own build, never overwritten; only the manifest is published on Pages, pointing at it. Optional: without it the
+    # one blob per zoom-12 tile in a PMTiles archive cut into parts of <= 400 MB (BeamNG.Earth
+    # tools/build_osm_tag_shards.py; a copy in this repo, as the tiles workflow's builder: this job holds the R2
+    # secrets, so it runs no code fetched from elsewhere). The parts (~2.4 GB in all, over Pages' 1 GB; each under the
+    # 512 MB Cloudflare's free plan caches) go to the tile host (R2 behind tiles.tgforever.net) under a key of their
+    # own build, never overwritten; only the manifest is published on Pages, pointing at them. Optional: without it the
     # server reads the Layercake file as before.
     runs-on: ubuntu-latest
     timeout-minutes: 300
@@ -143,7 +144,7 @@ jobs:
           python tools/build_osm_tag_shards.py https://data.openstreetmap.us/layercake/highways.parquet \
             "$D/out/osmtags" --workers 3 --tmp "$D/tmp"
           rm -rf "$D/tmp"
-      - name: The archive to the tile host, the manifest pointing at it
+      - name: The archive's parts to the tile host, the manifest pointing at them
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -152,17 +153,25 @@ jobs:
         run: |
           D=$OTG/out/osmtags
           KEY=$(python -c "import json, re; print(re.sub(r'[^0-9A-Za-z]+', '_', json.load(open('$D/manifest.json'))['built']))")
-          aws s3 cp "$D/osmtags.pmtiles" "s3://bnge-tiles/osmtags/$KEY/osmtags.pmtiles" --endpoint-url "$R2" \
-            --only-show-errors --content-type application/octet-stream --cache-control "public, max-age=31536000, immutable"
-          python - "$D/manifest.json" "https://tiles.tgforever.net/osmtags/$KEY/osmtags.pmtiles" <<'PY'
+          ls -l "$D"
+          for f in "$D"/osmtags*.pmtiles; do
+            # (Cloudflare's free plan caches files up to 512 MB: a bigger part would answer every read from R2)
+            test "$(stat -c %s "$f")" -lt 536870912
+            aws s3 cp "$f" "s3://bnge-tiles/osmtags/$KEY/$(basename "$f")" --endpoint-url "$R2" --only-show-errors \
+              --content-type application/octet-stream --cache-control "public, max-age=31536000, immutable"
+          done
+          python - "$D/manifest.json" "https://tiles.tgforever.net/osmtags/$KEY" <<'PY'
           import json, sys
           m = json.load(open(sys.argv[1]))
-          m["archive"] = sys.argv[2]
+          for p in m.get("parts", []):
+              p["archive"] = f"{sys.argv[2]}/{p['archive']}"
+          if "archive" in m:
+              m["archive"] = f"{sys.argv[2]}/{m['archive']}"
           json.dump(m, open(sys.argv[1], "w"), separators=(",", ":"))
           PY
-          rm "$D/osmtags.pmtiles"
+          rm "$D"/osmtags*.pmtiles
           mkdir -p out && cp -r "$D" out/
-          cat out/osmtags/manifest.json | head -c 400; echo
+          cat out/osmtags/manifest.json | head -c 1200; echo
       - uses: actions/upload-artifact@v4
         with:
           name: osmtags
@@ -238,6 +247,20 @@ jobs:
           cp README.md site/
           printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>, lane-level road tags: <a href="lanes/manifest.json">lanes/manifest.json</a>, highway sign sources: <a href="signs/manifest.json">signs/manifest.json</a>, fuel and charging stations: <a href="stations/manifest.json">stations/manifest.json</a>, level crossings (US): <a href="fra/manifest.json">fra/manifest.json</a>, measured German roofs: <a href="lod2/manifest.json">lod2/manifest.json</a> (sources and licences: <a href="lod2/ATTRIBUTION.md">lod2/ATTRIBUTION.md</a>), measured roofs of Switzerland, Estonia and Vienna: <a href="lod2-ch/ATTRIBUTION.md">lod2-ch</a>, <a href="lod2-ee/ATTRIBUTION.md">lod2-ee</a>, <a href="lod2-wien/ATTRIBUTION.md">lod2-wien</a>, New York building massing: <a href="nycmassing/v1/manifest.json">nycmassing/v1/manifest.json</a> (<a href="nycmassing/ATTRIBUTION.md">nycmassing/ATTRIBUTION.md</a>). Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
           ls site
+      - name: The datasets' files to the tile host, each manifest naming that copy ("data")
+        # (players read ~1.15 TB a month of these from Pages, whose soft limit is 100 GB: BeamNG.Earth's server reads a
+        # dataset's files from the manifest's "data", R2 behind tiles.tgforever.net, cached by Cloudflare; Pages keeps
+        # every file too, for clients from before. tools/mirror_data.py is this repo's own, run with the R2 token: no
+        # code from elsewhere here. A dataset that fails stays on Pages only; the site still publishes.)
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          aws configure set default.s3.max_concurrent_requests 32
+          python3 tools/mirror_data.py site
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
