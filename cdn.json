@@ -1,1 +1,1 @@
-{"imagery": {"bngs2": {"enabled": true}}}
+{"imagery": {"bngs2": {"enabled": true}}, "dem": {"bngmt": {"enabled": true, "release": "0.0.13"}}}
