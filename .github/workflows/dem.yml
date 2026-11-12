@@ -125,6 +125,9 @@ jobs:
           SOURCE: ${{ github.event.inputs.source }}
         run: |
           set -euo pipefail
+          # (packs are at most ~16 MB: one PutObject each, never a multipart upload, whose completion R2 refused with
+          # InvalidPart for a 9 MB pack, run 43151026907 shard 100)
+          aws configure set default.s3.multipart_threshold 64MB
           read -r i t0 t1 <<< "$SHARD"
           PREFIX="dem/mapterhorn/$RELEASE"
           MARK="$PREFIX/_build/$SHARDS/done/$i.json"
