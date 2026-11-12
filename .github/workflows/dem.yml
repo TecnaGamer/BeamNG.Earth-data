@@ -140,8 +140,16 @@ jobs:
           n=$(find out -name '*.bngp' 2>/dev/null | wc -l)
           mb=$(du -sm out 2>/dev/null | cut -f1 || echo 0)
           if [ "$n" -gt 0 ]; then
-            aws s3 cp out "s3://$BUCKET/$PREFIX" --recursive --exclude "*.tmp" --endpoint-url "$R2" --only-show-errors \
-              --content-type application/octet-stream --cache-control "public, max-age=2592000, immutable"
+            # (R2 answers an occasional PutObject with 503 "Reduce your concurrent request rate": run 43151026907's
+            # shard 18; tried again by sync, which skips the packs already there)
+            up=(--exclude "*.tmp" --endpoint-url "$R2" --only-show-errors \
+                --content-type application/octet-stream --cache-control "public, max-age=2592000, immutable")
+            ok=0
+            for try in 1 2 3 4; do
+              if aws s3 sync out "s3://$BUCKET/$PREFIX" "${up[@]}"; then ok=1; break; fi
+              echo "upload try $try failed: again in $((try * 20)) s"; sleep $((try * 20))
+            done
+            [ "$ok" -eq 1 ] || { echo "::warning::shard $i: upload failed (run the workflow again)"; exit 1; }
           fi
           echo "shard $i ($t0..$t1): status $st, $n packs uploaded ($mb MB)" | tee -a "$GITHUB_STEP_SUMMARY"
           if [ "$st" -ne 0 ]; then
