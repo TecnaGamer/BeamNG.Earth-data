@@ -2,9 +2,16 @@
 # land (server/tilepack.py, imagery source "bngs2"), built from ESA WorldCover's 2021 Sentinel-2 RGBNIR composite
 # (CC BY 4.0, "Contains modified Copernicus Sentinel data 2021") by tools/build_s2_packs.py (a copy from BeamNG.Earth,
 # in this repo). Manual only: Actions -> tiles -> Run workflow. Players use the packs only when cdn.json (this repo) turns
-# "bngs2" on.
+# "bngs2" on (and, for zoom 13+, raises its "max_zoom").
+#   zoom: 12 (JPEG, then zooms 11..8 from it in each region job, and 7..3 in the coarse job) or 13 / 14 (WebP, that
+#         zoom alone: resumable, see below)
 #   regions: "all" (every zoom-5 tile with land) or a list "x,y x,y" of zoom-5 tiles
-#   coarse: also build zooms 7..3 from the zoom-8 packs in the bucket (after the regions)
+#   coarse: zoom 12: also build zooms 7..3 from the zoom-8 packs in the bucket (after the regions)
+#   max_lat: zoom 13+: only packs reaching within this many degrees of the equator (z14: 50)
+# Zoom 13+ is resumable: a region whose packs are all built gets a marker (s2wc/v1/_done/<zoom>/<x>_<y>.json) and is
+# skipped by later runs; a region cut off by a job's time budget keeps its uploaded packs (skipped next time, from the
+# bucket's listing) and is finished by running the workflow again with the same inputs. The check job lists the
+# regions still to do.
 # Secrets (repo settings): R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY (an R2 token: Object Read & Write,
 # this bucket only).
 name: tiles
@@ -16,8 +23,14 @@ on:
         description: 'zoom-5 tiles: "all" or "x,y x,y ..."'
         default: "all"
       coarse:
-        description: "build zooms 7..3 too (true/false)"
+        description: "zoom 12: build zooms 7..3 too (true/false)"
         default: "true"
+      zoom:
+        description: "the photo zoom: 12 (JPEG, + 11..3) or 13 / 14 (WebP, alone)"
+        default: "12"
+      max_lat:
+        description: "zoom 13+: only packs within this latitude (blank: all)"
+        default: ""
 
 permissions:
   contents: read
@@ -33,38 +46,56 @@ jobs:
       chunks: ${{ steps.plan.outputs.chunks }}
     steps:
       - id: plan
-        name: "The zoom-5 tiles with land (from the composite's 1-degree file list), in chunks"
+        name: "The zoom-5 tiles with land (from the composite's 1-degree file list), in chunks of about equal work"
+        env:
+          REGIONS: ${{ github.event.inputs.regions }}
+          ZOOM: ${{ github.event.inputs.zoom }}
+          MAX_LAT: ${{ github.event.inputs.max_lat }}
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json, math, re, urllib.parse, urllib.request
-          want = """${{ github.event.inputs.regions }}""".strip()
-          if want and want != "all":
-              tiles = sorted({tuple(int(v) for v in t.split(",")) for t in want.split()})
-          else:
-              names, token = [], None
-              while True:
-                  u = "https://esa-worldcover-s2.s3.eu-central-1.amazonaws.com/?list-type=2&prefix=rgbnir/2021/&max-keys=1000"
-                  if token:
-                      u += "&continuation-token=" + urllib.parse.quote(token)
-                  body = urllib.request.urlopen(u, timeout=60).read().decode()
-                  names += re.findall(r"_([NS]\d\d)([EW]\d{3})_S2RGBNIR\.tif", body)
-                  m = re.search(r"<NextContinuationToken>([^<]+)</NextContinuationToken>", body)
-                  if not m:
-                      break
-                  token = m.group(1)
-              tiles = set()
-              for ns, ew in names:
-                  la = int(ns[1:]) * (1 if ns[0] == "N" else -1)
-                  lo = int(ew[1:]) * (1 if ew[0] == "E" else -1)
-                  for dla in (0.0, 0.999):
-                      for dlo in (0.0, 0.999):
-                          lat, lon = max(-85.0, min(85.0, la + dla)), lo + dlo
-                          x = int((lon + 180) / 360 * 32)
-                          y = int((1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * 32)
-                          tiles.add((min(31, x), min(31, max(0, y))))
-              tiles = sorted(tiles)
-          per = max(1, math.ceil(len(tiles) / 200))      # (a matrix takes at most 256 jobs)
-          chunks = [" ".join(f"{x},{y}" for x, y in tiles[i:i + per]) for i in range(0, len(tiles), per)]
+          import json, math, os, re, urllib.parse, urllib.request
+          z = int(os.environ.get("ZOOM") or 12)
+          max_lat = float(os.environ["MAX_LAT"]) if os.environ.get("MAX_LAT", "").strip() else None
+          want = os.environ.get("REGIONS", "").strip() or "all"
+          if not re.fullmatch(r"all|(\d+,\d+)(\s+\d+,\d+)*", want):
+              raise SystemExit(f"bad regions: {want!r}")
+          names, token = [], None
+          while True:
+              u = "https://esa-worldcover-s2.s3.eu-central-1.amazonaws.com/?list-type=2&prefix=rgbnir/2021/&max-keys=1000"
+              if token:
+                  u += "&continuation-token=" + urllib.parse.quote(token)
+              body = urllib.request.urlopen(u, timeout=60).read().decode()
+              names += re.findall(r"_([NS]\d\d)([EW]\d{3})_S2RGBNIR\.tif", body)
+              m = re.search(r"<NextContinuationToken>([^<]+)</NextContinuationToken>", body)
+              if not m:
+                  break
+              token = m.group(1)
+          # work per zoom-5 tile: its land files' quarters, each weighted by the overview level the zoom reads there
+          # (build_s2_packs.level_for: a level finer is 4x the bytes)
+          work = {}
+          for ns, ew in names:
+              la = int(ns[1:]) * (1 if ns[0] == "N" else -1)
+              lo = int(ew[1:]) * (1 if ew[0] == "E" else -1)
+              merc = 156543.034 * math.cos(math.radians(la + 0.5)) / (1 << z)
+              lvl = int(max(0, min(4, math.floor(math.log2(max(merc / (111320.0 / 12000), 1.0))))))
+              for dla in (0.0, 0.5, 0.999):
+                  for dlo in (0.0, 0.5, 0.999):
+                      lat, lon = max(-85.0, min(85.0, la + dla)), lo + dlo
+                      if max_lat is not None and abs(lat) >= max_lat + 1:
+                          continue
+                      x = min(31, int((lon + 180) / 360 * 32))
+                      y = min(31, max(0, int((1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * 32)))
+                      work[(x, y)] = work.get((x, y), 0.0) + 4.0 ** -lvl / 9
+          if want != "all":
+              work = {t: work.get(t, 1.0) for t in {tuple(int(v) for v in r.split(",")) for r in want.split()}}
+          # longest first into the lightest of n bins (a matrix takes at most 256 jobs)
+          n = min(len(work), 200 if z <= 12 else 250)
+          bins = [[0.0, []] for _ in range(n)]
+          for t, w in sorted(work.items(), key=lambda kv: -kv[1]):
+              b = min(bins, key=lambda b: b[0])
+              b[0] += w
+              b[1].append(t)
+          chunks = [" ".join(f"{x},{y}" for x, y in sorted(b[1])) for b in bins if b[1]]
           print("chunks=" + json.dumps(chunks))
           PY
         shell: bash
@@ -72,7 +103,7 @@ jobs:
   regions:
     needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 355
     strategy:
       fail-fast: false
       max-parallel: 20
@@ -93,18 +124,92 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          CHUNK: ${{ matrix.chunk }}
+          ZOOM: ${{ github.event.inputs.zoom }}
+          MAX_LAT: ${{ github.event.inputs.max_lat }}
+          S2_BLOCK_CACHE: "700"     # decoded source blocks kept (~6 MB each): a pack row's blocks for the next row
         run: |
-          for r in ${{ matrix.chunk }}; do
+          Z=${ZOOM:-12}
+          CP=(--endpoint-url "$R2" --only-show-errors)
+          META=(--content-type application/octet-stream --cache-control "public, max-age=2592000, immutable")
+          if [ "$Z" -le 12 ]; then
+            for r in $CHUNK; do
+              x=${r%,*}; y=${r#*,}
+              rm -rf out && mkdir out
+              python tools/build_s2_packs.py out --zoom "$Z" --z5 "$x" "$y" --workers 6
+              aws s3 cp out "s3://$BUCKET/$PREFIX" --recursive "${CP[@]}" "${META[@]}"
+            done
+            exit 0
+          fi
+          # zoom 13+: WebP, that zoom alone, resumable; no pack started after 5 h (the job's limit is 6 h)
+          DEADLINE=$(( $(date +%s) + 300 * 60 ))
+          LAT=(); if [ -n "$MAX_LAT" ]; then LAT=(--max-lat "$MAX_LAT"); fi
+          ( while sleep 300; do
+              echo "[mon] load $(cut -d' ' -f1-3 /proc/loadavg), rx $(awk 'NR > 2 && $1 !~ /^lo:/ {s += $2} END {print int(s / 1e6)}' /proc/net/dev) MB, $(free -m | awk '/Mem/ {print $3}') MB used, $(df -m . | awk 'NR == 2 {print $4}') MB free"
+            done ) &
+          MON=$!
+          trap 'kill $MON 2>/dev/null || true' EXIT
+          for r in $CHUNK; do
             x=${r%,*}; y=${r#*,}
+            if aws s3 ls "s3://$BUCKET/$PREFIX/_done/$Z/${x}_${y}.json" --endpoint-url "$R2" >/dev/null 2>&1; then
+              echo "region $x,$y: done before"; continue
+            fi
+            if [ "$(date +%s)" -gt "$DEADLINE" ]; then
+              echo "region $x,$y: left for the next run (time)"; continue
+            fi
             rm -rf out && mkdir out
-            python tools/build_s2_packs.py out --zoom 12 --z5 "$x" "$y" --workers 6
-            aws s3 cp out "s3://$BUCKET/$PREFIX" --recursive --endpoint-url "$R2" --only-show-errors \
-              --content-type application/octet-stream --cache-control "public, max-age=2592000, immutable"
+            : > skip.txt
+            d=$(( Z - 8 ))
+            for ((i = 0; i < (1 << d); i++)); do
+              px=$(( (x << d) + i ))
+              aws s3 ls "s3://$BUCKET/$PREFIX/$Z/$px/" --endpoint-url "$R2" 2>/dev/null \
+                | awk -v p="$Z/$px/" '$4 ~ /\.bngp$/ {print p $4}' >> skip.txt || true
+            done
+            before=$(wc -l < skip.txt)
+            echo "region $x,$y: $before packs in the bucket already"
+            set +e
+            python tools/build_s2_packs.py out --zoom "$Z" --min-zoom "$Z" --z5 "$x" "$y" --format webp \
+              --skip skip.txt --deadline "$DEADLINE" --workers 12 "${LAT[@]}"
+            st=$?
+            set -e
+            n=$(find out -name '*.bngp' | wc -l)
+            mb=$(du -sm out | cut -f1)
+            if [ "$n" -gt 0 ]; then
+              aws s3 cp out "s3://$BUCKET/$PREFIX" --recursive --exclude "*.tmp" "${CP[@]}" "${META[@]}"
+            fi
+            echo "region $x,$y: status $st, $n packs uploaded ($mb MB)"
+            if [ "$st" -eq 0 ]; then
+              printf '{"zoom": %d, "region": [%d, %d], "uploaded": %d, "mb": %d, "before": %d, "built": "%s"}\n' \
+                "$Z" "$x" "$y" "$n" "$mb" "$before" "$(date -u +%FT%TZ)" > done.json
+              aws s3 cp done.json "s3://$BUCKET/$PREFIX/_done/$Z/${x}_${y}.json" "${CP[@]}" \
+                --content-type application/json
+            elif [ "$st" -ne 75 ]; then
+              echo "::warning::region $x,$y: builder status $st (its packs so far uploaded; run again)"
+            fi
           done
+
+  check:
+    needs: [plan, regions]
+    if: ${{ always() && github.event.inputs.zoom != '12' && github.event.inputs.zoom != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Regions done / still to do (run the workflow again with the same inputs for the rest)"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          CHUNKS: ${{ needs.plan.outputs.chunks }}
+          ZOOM: ${{ github.event.inputs.zoom }}
+        run: |
+          aws s3 ls "s3://$BUCKET/$PREFIX/_done/$ZOOM/" --endpoint-url "$R2" | awk '{print $4}' | sed 's/\.json$//' | sort > done.txt || true
+          python3 -c 'import json, os; print("\n".join(r.replace(",", "_") for c in json.loads(os.environ["CHUNKS"]) for r in c.split()))' | sort > want.txt
+          echo "zoom $ZOOM: $(comm -12 want.txt done.txt | wc -l) of $(wc -l < want.txt) regions done, $(comm -23 want.txt done.txt | wc -l) left" | tee -a "$GITHUB_STEP_SUMMARY"
+          comm -23 want.txt done.txt | tr '\n' ' ' | tee -a "$GITHUB_STEP_SUMMARY"
 
   coarse:
     needs: regions
-    if: ${{ always() && github.event.inputs.coarse == 'true' }}
+    if: ${{ always() && github.event.inputs.coarse == 'true' && (github.event.inputs.zoom == '12' || github.event.inputs.zoom == '') }}
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
