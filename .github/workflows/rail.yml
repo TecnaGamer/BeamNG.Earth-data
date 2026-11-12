@@ -150,15 +150,23 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          # (aws-cli 2.23+ sends its default CRC checksums with every multipart part; R2's CompleteMultipartUpload then
+          # refused the parts, "InvalidPart", 2026-11-12: Cloudflare's advice is checksums only when required)
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
         run: |
           D=$OTG/out/osmtags
           KEY=$(python -c "import json, re; print(re.sub(r'[^0-9A-Za-z]+', '_', json.load(open('$D/manifest.json'))['built']))")
-          ls -l "$D"
+          aws --version; ls -l "$D"
+          aws configure set default.s3.multipart_chunksize 64MB
           for f in "$D"/osmtags*.pmtiles; do
             # (Cloudflare's free plan caches files up to 512 MB: a bigger part would answer every read from R2)
             test "$(stat -c %s "$f")" -lt 536870912
-            aws s3 cp "$f" "s3://bnge-tiles/osmtags/$KEY/$(basename "$f")" --endpoint-url "$R2" --only-show-errors \
-              --content-type application/octet-stream --cache-control "public, max-age=31536000, immutable"
+            for try in 1 2 3; do
+              aws s3 cp "$f" "s3://bnge-tiles/osmtags/$KEY/$(basename "$f")" --endpoint-url "$R2" --only-show-errors \
+                --content-type application/octet-stream --cache-control "public, max-age=31536000, immutable" && break
+              test "$try" -lt 3; sleep $((try * 20))
+            done
           done
           python - "$D/manifest.json" "https://tiles.tgforever.net/osmtags/$KEY" <<'PY'
           import json, sys
@@ -258,6 +266,8 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (see the osmtags job)
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
         run: |
           aws configure set default.s3.max_concurrent_requests 32
           python3 tools/mirror_data.py site
