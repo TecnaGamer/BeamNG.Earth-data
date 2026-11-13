@@ -1,0 +1,163 @@
+# One build job of the bnwt workflow (bnwt.yml) and its upload: called once per matrix entry, so a job's output goes
+# to the bucket as soon as it is built (artifacts never hold more than ~20 jobs' output at once).
+#   build:  NO secrets. BeamNG.Earth's tools/build_bnwt.py at the pinned commit builds the entry's shards one after the
+#           other (each with a fresh source cache: a runner's disk holds one shard's sources), none started after the
+#           time budget; the finished shards' parts and records become an artifact.
+#   upload: the R2 secrets; runs only this repo's tools/bnwt_ci.py check (every file named as a part or record of this
+#           release, its size and SHA-256 as its record says; anything else rejects the whole artifact) and aws-cli:
+#           the parts first, the records (the shards' done markers) after them; then deletes the artifact.
+name: bnwt-shards
+
+on:
+  workflow_call:
+    inputs:
+      id: {type: string, required: true}
+      archive: {type: string, required: true}
+      shards: {type: string, required: true}
+      of: {type: string, required: true}
+      sha: {type: string, required: true}
+      release: {type: string, required: true}
+      format: {type: string, required: true}
+      workers: {type: string, default: "4"}
+      dry_run: {type: boolean, default: false}
+    secrets:
+      R2_ACCOUNT_ID: {required: false}
+      R2_ACCESS_KEY_ID: {required: false}
+      R2_SECRET_ACCESS_KEY: {required: false}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    outputs:
+      artifact: ${{ steps.art.outputs.artifact-id }}
+    steps:
+      - name: Inputs
+        env:
+          ARCHIVE: ${{ inputs.archive }}
+          SHARDS: ${{ inputs.shards }}
+          OF: ${{ inputs.of }}
+          SHA: ${{ inputs.sha }}
+          RELEASE: ${{ inputs.release }}
+          WORKERS: ${{ inputs.workers }}
+        run: |
+          [[ "$ARCHIVE" =~ ^(base|transportation|buildings|places)$ && "$SHARDS" =~ ^[0-9\ ]+$ && "$OF" =~ ^[0-9]+$ \
+             && "$SHA" =~ ^[0-9a-f]{40}$ && "$RELEASE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\.[0-9]+$ && "$WORKERS" =~ ^[1-8]$ ]]
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          repository: TecnaGamer/BeamNG.Earth
+          ref: ${{ inputs.sha }}
+          path: code
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: earthfast
+          path: code/server
+      - name: Packages and room on the runner
+        run: |
+          python -m pip install -q -r code/server/requirements.txt
+          # (the preinstalled SDKs this job does not use: ~30 GB; rail.yml's osmtags job)
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          D=/mnt/bnwt; [ "$(df --output=avail -B1G /mnt 2>/dev/null | tail -1)" -gt 20 ] 2>/dev/null || D=$HOME/bnwt
+          sudo mkdir -p "$D" && sudo chown "$USER" "$D"
+          echo "D=$D" >> "$GITHUB_ENV"
+          df -h / /mnt || true; free -h
+      - name: Build the shards
+        timeout-minutes: 330
+        env:
+          ARCHIVE: ${{ inputs.archive }}
+          SHARDS: ${{ inputs.shards }}
+          OF: ${{ inputs.of }}
+          RELEASE: ${{ inputs.release }}
+          WORKERS: ${{ inputs.workers }}
+        run: |
+          set -uo pipefail
+          DEADLINE=$(( $(date +%s) + 280 * 60 ))      # (no shard started after 4 h 40 min: a shard takes up to ~1 h)
+          ( while sleep 300; do
+              echo "[mon] load $(cut -d' ' -f1-3 /proc/loadavg), $(free -m | awk '/Mem/ {print $3}') MB used, $(df -m "$D" | awk 'NR == 2 {print $4}') MB free"
+            done ) &
+          MON=$!
+          trap 'kill $MON 2>/dev/null || true' EXIT
+          ok=0; failed=0; left=0
+          for i in $SHARDS; do
+            if [ "$(date +%s)" -gt "$DEADLINE" ]; then left=$((left + 1)); continue; fi
+            t0=$(date +%s)
+            if python code/tools/build_bnwt.py --archive "$ARCHIVE" --world --release "$RELEASE" --out "$D/out" \
+                 --work "$D/work" --cache-dir "$D/cache" --jobs "$WORKERS" --shard "$i/$OF" --shard-parts; then
+              ok=$((ok + 1))
+            else
+              failed=$((failed + 1)); echo "::warning::shard $i/$OF failed"
+            fi
+            rm -rf "$D/work" "$D/cache"
+            echo "shard $i: $(( $(date +%s) - t0 )) s, output $(du -sm "$D/out" 2>/dev/null | cut -f1) MB"
+          done
+          echo "$ARCHIVE: $ok shards built, $failed failed, $left left for the next run" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "FAILED=$failed" >> "$GITHUB_ENV"
+      - id: art
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: bnwt-${{ inputs.id }}
+          path: ${{ env.D }}/out/bnwt${{ inputs.format }}/${{ inputs.release }}/
+          retention-days: 3
+          compression-level: 0          # (the tiles are zstd already)
+          if-no-files-found: ignore
+          overwrite: true
+      - if: ${{ env.FAILED != '0' }}
+        run: exit 1
+
+  upload:
+    needs: build
+    if: ${{ !cancelled() && !inputs.dry_run && needs.build.outputs.artifact != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: bnwt-${{ inputs.id }}
+          path: in
+      - name: Check, then upload the parts and the records
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (R2 refused aws-cli's default checksums: rail.yml)
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          RELEASE: ${{ inputs.release }}
+          FORMAT: ${{ inputs.format }}
+        run: |
+          set -euo pipefail
+          python3 tools/bnwt_ci.py check in stage --release "$RELEASE" --format "$FORMAT" | tee -a "$GITHUB_STEP_SUMMARY"
+          P="s3://bnge-tiles/bnwt$FORMAT/$RELEASE"
+          aws configure set default.s3.multipart_chunksize 64MB
+          if [ -d stage/parts ]; then
+            ok=0
+            for try in 1 2 3 4; do
+              if aws s3 sync stage/parts "$P" --endpoint-url "$R2" --only-show-errors --content-type application/octet-stream \
+                   --cache-control "public, max-age=31536000, immutable"; then ok=1; break; fi
+              echo "upload try $try failed: again in $((try * 30)) s"; sleep $((try * 30))
+            done
+            [ "$ok" -eq 1 ] || { echo "::error::parts not uploaded (records held back: run the workflow again)"; exit 1; }
+          fi
+          if [ -d stage/records ]; then
+            aws s3 cp stage/records "$P" --recursive --endpoint-url "$R2" --only-show-errors --content-type application/json \
+              --cache-control "no-cache"
+          fi
+      - name: The artifact, now in the bucket, deleted
+        if: ${{ success() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ID: ${{ needs.build.outputs.artifact }}
+        run: gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$ID" || true

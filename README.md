@@ -84,7 +84,21 @@ from openly licensed photos only: USDA NAIP through Microsoft's Planetary Comput
 Production and Conservation Business Center"). The prebaked set (US / open-Europe metro areas and main road corridors,
 `aerial/sets/*.npz`, from US Census 2020 urban areas, TIGER primary roads, GHSL GHS-SMOD 2020 (CC BY 4.0) and Natural
 Earth roads) is built here; other places are built on demand by the project's mini PC. BeamNG.Earth reads them when
-`cdn.json` turns `"imagery"` -> `"bngaer"` on.
+`cdn.json` turns `"imagery"` -> `"bngaer"` on. The jobs that build hold no secrets; the upload jobs check each build's
+artifact (`tools/aerial_ci.py check`: a pack's header against its path, a cell's fragment against the packs on hand)
+before anything goes to the bucket. Maryland's six-inch imagery and other state sets are not used (no verified licence).
+
+## bnwt<FORMAT>/<release>/: prebaked world input tiles (tile host only, workflow "bnwt"; not built yet)
+
+BeamNG.Earth's own z14 input tiles (`server/bnwt.py`: per cell exactly what the server's Overture source gives, one
+range read for a block of cells): the archives `base` (water, land use, infrastructure), `transportation`, `buildings`
+(ODbL 1.0, `ATTRIBUTION-overture-odbl.txt`) and `places` (CDLA-Permissive-2.0 and its sources' licences,
+`ATTRIBUTION-overture-places.txt`), each `<name>.c<CONTENT>.index.json`, a manifest (sizes, SHA-256s) and its parts
+(PMTiles v3, at most 400 MB). Built monthly (the 26th, after Overture's release) by BeamNG.Earth's
+`tools/build_bnwt.py` at a pinned release tag or commit, in shard jobs without secrets; `tools/bnwt_ci.py` checks every
+part against its shard's record before upload, and an archive's index is written last, once all of its shards are up.
+The server reads them when `BNGE_BNWT_URL` is `https://tiles.tgforever.net`. Data © OpenStreetMap contributors,
+Overture Maps Foundation.
 
 ## addons.json: the in-game Add-ons page's list (edited by hand)
 The add-ons BeamNG.Earth's Add-ons page offers and lets players install (server/addons.py, REGISTRY_URL; read through

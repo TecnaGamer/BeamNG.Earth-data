@@ -1,0 +1,355 @@
+# BeamNG.Earth's prebaked world input tiles (BNWT, server/bnwt.py: per z14 cell exactly what the server's own Overture
+# source gives, one range read for a block of cells) for the whole world, on the tile host (Cloudflare R2 bnge-tiles
+# behind tiles.tgforever.net) under bnwt<FORMAT>/<Overture release>/: the archives base (water, land use,
+# infrastructure), transportation, buildings and places, each an index (<name>.index.json), a manifest and its parts
+# (PMTiles v3, <= 400 MB each). The server reads them when BNGE_BNWT_URL is https://tiles.tgforever.net.
+#
+# The builder is BeamNG.Earth's tools/build_bnwt.py with its native module, so it runs ONLY in jobs without secrets, at
+# one pinned commit for the whole run (code_ref: a release tag or a full commit SHA, never a branch; default the latest
+# published release, never a dev pre-release). Those jobs hand their output on as artifacts; the jobs holding the R2
+# secrets run nothing but this repo's tools/bnwt_ci.py (standard library: checks every file against its record's size
+# and SHA-256 before upload) and aws-cli.
+#
+# Each archive is cut into `shards` contiguous runs of its z10 units (build_bnwt --shard I/N --shard-parts: each shard
+# its own parts and a record _build/<name>/<N>/<I>.json, uploaded after the parts). Resumable: a shard with a record in
+# the bucket is skipped by later runs, a build job stops starting shards after its time budget, so running the workflow
+# again with the same inputs finishes the rest. The index of an archive is written last (finalize), once every shard of
+# it is done: until then players read the sources as before.
+#   code_ref: the BeamNG.Earth tag or commit (blank: the latest release); its build_bnwt.py must know --shard-parts
+#   release:  the Overture release: "latest" (stac.overturemaps.org), "pinned" (the code's overture.RELEASE) or an id
+#   archives: which of base transportation buildings places
+#   shards:   shards per archive (keep it the same across the runs of a release: records and part names carry it)
+#   jobs:     build jobs in this run (<= 250, 20 at once; each up to ~5 h)
+#   only:     blank: every shard; else shard numbers "744 3477" (a trial)
+#   dry_run:  build only (artifacts kept 3 days), no upload, no index
+# Scheduled monthly on the 26th (Overture publishes around the third Wednesday) with the defaults.
+# Secrets (repo settings): R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.
+name: bnwt
+
+on:
+  schedule:
+    - cron: "17 5 26 * *"
+  workflow_dispatch:
+    inputs:
+      code_ref:
+        description: "BeamNG.Earth release tag or full commit SHA (blank: the latest release)"
+        default: ""
+      release:
+        description: 'Overture release: "latest", "pinned" (the code''s) or an id like 2026-10-21.0'
+        default: "latest"
+      archives:
+        description: "archives to build"
+        default: "base transportation buildings places"
+      shards:
+        description: "shards per archive (the same for every run of a release)"
+        default: "4096"
+      jobs:
+        description: "build jobs in this run (<= 250)"
+        default: "200"
+      only:
+        description: 'blank: every shard; else shard numbers "744 3477" (a trial)'
+        default: ""
+      workers:
+        description: "build processes per job (4 vCPUs, 16 GB)"
+        default: "4"
+      dry_run:
+        description: "build only: no upload, no index"
+        type: boolean
+        default: false
+      finalize:
+        description: "write each complete archive's index"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bnwt
+  cancel-in-progress: false
+
+env:
+  BUCKET: bnge-tiles
+  CODE_REPO: TecnaGamer/BeamNG.Earth
+
+jobs:
+  prep:
+    # (no secrets: runs the pinned BeamNG.Earth code)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      sha: ${{ steps.ref.outputs.sha }}
+      ref: ${{ steps.ref.outputs.ref }}
+      skip: ${{ steps.code.outputs.skip }}
+      release: ${{ steps.code.outputs.release }}
+      format: ${{ steps.code.outputs.format }}
+      names: ${{ steps.code.outputs.names }}
+    steps:
+      - id: ref
+        name: "The pinned BeamNG.Earth commit"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ github.event.inputs.code_ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "$REF" ]; then
+            REF=$(gh api "repos/$CODE_REPO/releases/latest" --jq .tag_name)
+          fi
+          [[ "$REF" =~ ^[0-9a-f]{40}$ || "$REF" =~ ^v[0-9][0-9A-Za-z.+-]*$ ]] || { echo "code_ref must be a tag or a full SHA: $REF"; exit 1; }
+          SHA=$(gh api "repos/$CODE_REPO/commits/$REF" --jq .sha)
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "BeamNG.Earth $REF = $SHA" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          repository: ${{ env.CODE_REPO }}
+          ref: ${{ steps.ref.outputs.sha }}
+          path: code
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
+        with:
+          python-version: "3.12"
+      - id: code
+        name: "Its builder, native module, archive names and the Overture release"
+        env:
+          RELEASE: ${{ github.event.inputs.release || 'latest' }}
+        run: |
+          set -euo pipefail
+          if ! grep -q -- "--shard-parts" code/tools/build_bnwt.py 2>/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::the pinned commit has no tools/build_bnwt.py with --shard-parts: nothing built (choose a code_ref that has it)"
+            exit 0
+          fi
+          python -m pip install -q -r code/server/requirements.txt
+          (cd code && python tools/build_native.py)
+          cd code/server
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, re, urllib.request
+          import bnwt, fast, overture
+          fast.require(bnwt.NATIVE, "bnwt workflow")
+          r = os.environ["RELEASE"].strip()
+          if r == "latest":
+              r = json.loads(urllib.request.urlopen("https://stac.overturemaps.org/catalog.json", timeout=60).read())["latest"]
+          elif r == "pinned":
+              r = overture.RELEASE
+          if not re.fullmatch(r"\d{4}-\d{2}-\d{2}\.\d+", r):
+              raise SystemExit(f"bad release {r!r}")
+          print("skip=false")
+          print("release=" + r)
+          print("format=" + str(bnwt.FORMAT))
+          print("names=" + json.dumps({a: f"{a}.c{bnwt.CONTENT[a]}" for a in bnwt.ARCHIVES}, separators=(",", ":")))
+          PY
+          cat "$GITHUB_OUTPUT" | tee -a "$GITHUB_STEP_SUMMARY"
+      - if: steps.code.outputs.skip != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: earthfast
+          path: code/server/earthfast.abi3.so
+          retention-days: 7
+          if-no-files-found: error
+
+  listing:
+    # (secrets: aws-cli only) what is in the bucket for this release already
+    needs: prep
+    if: ${{ needs.prep.outputs.skip != 'true' && github.event.inputs.dry_run != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: The release's keys in the bucket
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          PREFIX: bnwt${{ needs.prep.outputs.format }}/${{ needs.prep.outputs.release }}/
+        run: |
+          set -euo pipefail
+          aws s3 ls "s3://$BUCKET/$PREFIX" --recursive --endpoint-url "$R2" > listing.txt || true
+          echo "$(wc -l < listing.txt) keys under $PREFIX"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: listing
+          path: listing.txt
+          retention-days: 7
+
+  plan:
+    needs: [prep, listing]
+    if: ${{ !cancelled() && needs.prep.outputs.skip != 'true' && needs.prep.result == 'success' && needs.listing.result != 'failure' }}
+    runs-on: ubuntu-latest
+    outputs:
+      entries: ${{ steps.plan.outputs.entries }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - if: ${{ needs.listing.result == 'success' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: listing
+      - id: plan
+        env:
+          NAMES: ${{ needs.prep.outputs.names }}
+          RELEASE: ${{ needs.prep.outputs.release }}
+          FORMAT: ${{ needs.prep.outputs.format }}
+          ARCHIVES: ${{ github.event.inputs.archives || 'base transportation buildings places' }}
+          SHARDS: ${{ github.event.inputs.shards || '4096' }}
+          JOBS: ${{ github.event.inputs.jobs || '200' }}
+          ONLY: ${{ github.event.inputs.only }}
+        run: |
+          set -euo pipefail
+          [[ "$ARCHIVES" =~ ^[a-z\ ]+$ && "$SHARDS" =~ ^[0-9]+$ && "$JOBS" =~ ^[0-9]+$ && "$ONLY" =~ ^[0-9\ ]*$ ]]
+          L=(); [ -f listing.txt ] && L=(--listing listing.txt)
+          python3 tools/bnwt_ci.py plan --names "$NAMES" --archives "$ARCHIVES" --release "$RELEASE" --format "$FORMAT" \
+            --shards "$SHARDS" --jobs "$JOBS" --only "$ONLY" "${L[@]}" 2> plan.log > plan.json
+          cat plan.log | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 -c 'import json; print("entries=" + json.dumps(json.load(open("plan.json"))["entries"], separators=(",", ":")))' >> "$GITHUB_OUTPUT"
+
+  shards:
+    needs: [prep, plan]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.entries != '[]' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        entry: ${{ fromJson(needs.plan.outputs.entries) }}
+    permissions:
+      contents: read
+      actions: write          # (the upload job deletes its build job's artifact once it is in the bucket)
+    uses: ./.github/workflows/bnwt-shards.yml
+    with:
+      id: ${{ matrix.entry.id }}
+      archive: ${{ matrix.entry.archive }}
+      shards: ${{ matrix.entry.shards }}
+      of: ${{ github.event.inputs.shards || '4096' }}
+      sha: ${{ needs.prep.outputs.sha }}
+      release: ${{ needs.prep.outputs.release }}
+      format: ${{ needs.prep.outputs.format }}
+      workers: ${{ github.event.inputs.workers || '4' }}
+      dry_run: ${{ github.event.inputs.dry_run == 'true' }}
+    secrets:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+  records:
+    # (secrets: aws-cli only) every shard record of the archives, for their index
+    needs: [prep, shards]
+    if: ${{ !cancelled() && needs.prep.outputs.skip != 'true' && needs.prep.result == 'success' && github.event.inputs.dry_run != 'true' && github.event.inputs.finalize != 'false' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: The records and the release's listing
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          PREFIX: bnwt${{ needs.prep.outputs.format }}/${{ needs.prep.outputs.release }}
+          SHARDS: ${{ github.event.inputs.shards || '4096' }}
+          NAMES: ${{ needs.prep.outputs.names }}
+          ARCHIVES: ${{ github.event.inputs.archives || 'base transportation buildings places' }}
+        run: |
+          set -euo pipefail
+          aws configure set default.s3.max_concurrent_requests 32
+          for a in $ARCHIVES; do
+            n=$(python3 -c 'import json, os, sys; print(json.loads(os.environ["NAMES"])[sys.argv[1]])' "$a")
+            aws s3 sync "s3://$BUCKET/$PREFIX/_build/$n/$SHARDS/" "rec/$PREFIX/_build/$n/$SHARDS/" --endpoint-url "$R2" --only-show-errors
+            echo "$a ($n): $(ls "rec/$PREFIX/_build/$n/$SHARDS" 2>/dev/null | wc -l) of $SHARDS shards done" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+          aws s3 ls "s3://$BUCKET/$PREFIX/" --recursive --endpoint-url "$R2" > rec/listing.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: records
+          path: rec
+          retention-days: 7
+
+  assemble:
+    # (no secrets: the pinned code writes each complete archive's index, manifest and attribution from its records)
+    needs: [prep, records]
+    if: ${{ !cancelled() && needs.records.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          repository: ${{ env.CODE_REPO }}
+          ref: ${{ needs.prep.outputs.sha }}
+          path: code
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: earthfast
+          path: code/server
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: records
+          path: rec
+      - name: Index, manifest and attribution of each complete archive
+        env:
+          RELEASE: ${{ needs.prep.outputs.release }}
+          FORMAT: ${{ needs.prep.outputs.format }}
+          SHARDS: ${{ github.event.inputs.shards || '4096' }}
+          NAMES: ${{ needs.prep.outputs.names }}
+          ARCHIVES: ${{ github.event.inputs.archives || 'base transportation buildings places' }}
+        run: |
+          set -euo pipefail
+          python -m pip install -q -r code/server/requirements.txt
+          D="rec/bnwt$FORMAT/$RELEASE"
+          mkdir -p pub
+          for a in $ARCHIVES; do
+            n=$(python3 -c 'import json, os, sys; print(json.loads(os.environ["NAMES"])[sys.argv[1]])' "$a")
+            got=$(ls "$D/_build/$n/$SHARDS" 2>/dev/null | wc -l)
+            if [ "$got" -ne "$SHARDS" ]; then echo "$a: $got of $SHARDS shards: no index yet" | tee -a "$GITHUB_STEP_SUMMARY"; continue; fi
+            if grep -q " bnwt$FORMAT/$RELEASE/$n.index.json$" rec/listing.txt; then echo "$a: published already"; continue; fi
+            python code/tools/build_bnwt.py --archive "$a" --world --release "$RELEASE" --out rec --work work \
+              --cache-dir cache --assemble --from-shards "$SHARDS" | tee -a "$GITHUB_STEP_SUMMARY"
+            cp "$D/$n.index.json" "$D/$n.manifest.json" pub/
+            cp "$D"/ATTRIBUTION-*.txt pub/
+          done
+          cp rec/listing.txt .
+          ls -l pub
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: indexes
+          path: |
+            pub
+            listing.txt
+          retention-days: 7
+
+  publish:
+    # (secrets: this repo's checker and aws-cli only) the indexes last, once every part they name is in the bucket
+    needs: [prep, assemble]
+    if: ${{ !cancelled() && needs.assemble.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: indexes
+          path: in
+      - name: Check and publish
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          RELEASE: ${{ needs.prep.outputs.release }}
+          FORMAT: ${{ needs.prep.outputs.format }}
+        run: |
+          set -euo pipefail
+          if ! ls in/pub/*.index.json >/dev/null 2>&1; then echo "no archive complete in this run"; exit 0; fi
+          python3 tools/bnwt_ci.py published in/pub --release "$RELEASE" --format "$FORMAT" --listing in/listing.txt \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          P="s3://$BUCKET/bnwt$FORMAT/$RELEASE"
+          CP=(--endpoint-url "$R2" --only-show-errors)
+          for f in in/pub/ATTRIBUTION-*.txt; do
+            aws s3 cp "$f" "$P/$(basename "$f")" "${CP[@]}" --content-type "text/plain; charset=utf-8" --cache-control "public, max-age=86400"
+          done
+          for f in in/pub/*.manifest.json in/pub/*.index.json; do      # (the indexes last: a client reads an archive only through its index)
+            aws s3 cp "$f" "$P/$(basename "$f")" "${CP[@]}" --content-type application/json --cache-control "no-cache"
+          done
+          echo "published: $(cd in/pub && ls *.index.json | tr '\n' ' ')" | tee -a "$GITHUB_STEP_SUMMARY"
