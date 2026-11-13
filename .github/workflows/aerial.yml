@@ -1,0 +1,195 @@
+# BeamNG.Earth's 1 m aerial photo packs (imagery source "bngaer", server/aerialpacks.py): AVIF 4:4:4 tiles in BNGP
+# packs (server/tilepack.py) of zooms 17..14 on the tile host (Cloudflare R2 bnge-tiles, tiles.tgforever.net/aerial/v1/),
+# built by tools/build_aerial_packs.py (a PINNED copy from BeamNG.Earth: this job holds the R2 secrets, so it never
+# fetches code from another repo) from openly licensed photos only (USDA NAIP via the Planetary Computer: public domain).
+# The prebaked set (metro areas + main road corridors; aerial/sets/*.npz from the prebake study) is built here; the rest
+# is built on demand by the mini PC (the same builder). Manual only: Actions -> aerial -> Run workflow. Players use the
+# packs only when cdn.json turns "bngaer" on.
+#   set:      a file of aerial/sets/ without .npz (us_T5, us_T6, ...: zoom-14 tiles x, y; adm (state); cls)
+#   adm:      only these states / countries ("MD DC VA"), blank: the whole set
+#   gen:      the build generation (packs under g<gen>/; a cell built at this generation before is skipped)
+#   ratio:    the overview read for core / urban packs (1.0: the finest at <= the zoom-17 texel)
+#   ratio_corr: ... for corridor packs (1.3: NAIP's 1.2 m overview where it is 0.6 m: a quarter of the bytes read)
+# Resumable: every built cell leaves a fragment aerial/v1/_cells/<x>_<y>.json; a job past its time budget leaves the
+# rest for the next run with the same inputs (the plan skips cells with a fragment of this generation). The coverage
+# job rebuilds the touched regions' files aerial/v1/cov/<rx>/<ry>.json from ALL their fragments (the mini PC's too).
+# Secrets (repo settings): R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.
+name: aerial
+
+on:
+  workflow_dispatch:
+    inputs:
+      set:
+        description: "aerial/sets/<set>.npz (us_T5, us_T6, eu_core_T6, ...)"
+        default: "us_T5"
+      adm:
+        description: 'states / countries ("MD DC"), blank: all'
+        default: ""
+      gen:
+        description: "build generation"
+        default: "1"
+      ratio:
+        description: "overview ratio, core / urban packs"
+        default: "1.0"
+      ratio_corr:
+        description: "overview ratio, corridor packs"
+        default: "1.3"
+
+permissions:
+  contents: read
+
+env:
+  BUCKET: bnge-tiles
+  PREFIX: aerial/v1
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      chunks: ${{ steps.plan.outputs.chunks }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "numpy==2.3.4"
+      - name: "Cells done before (their fragments of this generation)"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          mkdir -p frags
+          aws s3 sync "s3://$BUCKET/$PREFIX/_cells/" frags/ --endpoint-url "$R2" --only-show-errors || true
+      - id: plan
+        name: "The set's cells, by state, in chunks of about equal packs"
+        env:
+          SET: ${{ github.event.inputs.set }}
+          ADM: ${{ github.event.inputs.adm }}
+          GEN: ${{ github.event.inputs.gen }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, re
+          import numpy as np
+          s = os.environ["SET"].strip()
+          if not re.fullmatch(r"[a-z]{2}(_[a-z]+)?_T[0-9a-z]+", s):
+              raise SystemExit(f"bad set: {s!r}")
+          adm = set(os.environ.get("ADM", "").split())
+          if not all(re.fullmatch(r"[A-Z]{2}", a) for a in adm):
+              raise SystemExit("bad adm")
+          gen = int(os.environ["GEN"])
+          d = np.load(f"aerial/sets/{s}.npz", allow_pickle=False)
+          done = set()
+          for n in os.listdir("frags"):
+              try:
+                  f = json.load(open(os.path.join("frags", n)))
+                  if int(f.get("g", 0)) >= gen or not f.get("p"):
+                      done.add(tuple(f["cell"]))
+              except Exception:
+                  pass
+          cells = {}
+          for x, y, a in zip(d["x"].tolist(), d["y"].tolist(), d["adm"].tolist()):
+              if adm and a not in adm:
+                  continue
+              c = (x >> 3, y >> 3)
+              if c not in done:
+                  cells[c] = cells.get(c, 0) + 1
+          n = max(1, min(250, len(cells) // 4 or 1))
+          bins = [[0, []] for _ in range(n)]
+          for c, w in sorted(cells.items(), key=lambda kv: -kv[1]):
+              b = min(bins, key=lambda b: b[0])
+              b[0] += w + 21               # (+ the cell's zooms 16..14)
+              b[1].append(c)
+          chunks = [" ".join(f"{x},{y}" for x, y in sorted(b[1])) for b in bins if b[1]]
+          print("chunks=" + json.dumps(chunks))
+          PY
+        shell: bash
+
+  build:
+    needs: plan
+    if: ${{ needs.plan.outputs.chunks != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        chunk: ${{ fromJson(needs.plan.outputs.chunks) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # (pinned: this job holds the R2 secrets; Pillow's wheels carry libavif with aom, rasterio's GDAL)
+      - run: pip install "numpy==2.3.4" "pillow==13.0.0" "rasterio==1.5.2"
+      - name: "The builder (tools/build_aerial_packs.py, server/tilepack.py: copies from BeamNG.Earth in this repo)"
+        run: test -f tools/build_aerial_packs.py && test -f server/tilepack.py
+      - name: Build and upload the chunk's cells
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          CHUNK: ${{ matrix.chunk }}
+          SET: ${{ github.event.inputs.set }}
+          GEN: ${{ github.event.inputs.gen }}
+          RATIO: ${{ github.event.inputs.ratio }}
+          RATIO_CORR: ${{ github.event.inputs.ratio_corr }}
+        run: |
+          set -euo pipefail
+          DEADLINE=$(( $(date +%s) + 320 * 60 ))
+          META=(--content-type application/octet-stream --cache-control "public, max-age=31536000, immutable")
+          ( while sleep 300; do
+              echo "[mon] load $(cut -d' ' -f1-3 /proc/loadavg), $(free -m | awk '/Mem/ {print $3}') MB used, $(df -m . | awk 'NR == 2 {print $4}') MB free"
+            done ) &
+          MON=$!
+          trap 'kill $MON 2>/dev/null || true' EXIT
+          for c in $CHUNK; do
+            if [ "$(date +%s)" -gt "$DEADLINE" ]; then echo "cell $c: left for the next run (time)"; continue; fi
+            rm -rf out && mkdir out
+            set +e
+            python tools/build_aerial_packs.py out --packs "aerial/sets/$SET.npz" --only-cells "$c" --gen "$GEN" \
+              --res-ratio "$RATIO" --res-ratio-corr "$RATIO_CORR" --workers 6 --fragments --deadline "$DEADLINE"
+            st=$?
+            set -e
+            if [ -d "out/g$GEN" ]; then
+              for i in 1 2 3 4; do
+                aws s3 cp "out/g$GEN" "s3://$BUCKET/$PREFIX/g$GEN" --recursive --exclude "*.tmp" \
+                  --endpoint-url "$R2" --only-show-errors "${META[@]}" && break
+                echo "upload try $i failed"; sleep $((20 * i))
+              done
+            fi
+            # the fragment last: a cell is done only once its packs are up
+            if [ "$st" -eq 0 ] && [ -d out/_cells ]; then
+              aws s3 cp out/_cells "s3://$BUCKET/$PREFIX/_cells" --recursive --endpoint-url "$R2" --only-show-errors \
+                --content-type application/json --cache-control "no-cache"
+            fi
+            echo "cell $c: status $st, $(du -sm out | cut -f1) MB"
+          done
+
+  coverage:
+    needs: [plan, build]
+    if: ${{ always() && needs.plan.outputs.chunks != '[]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "numpy==2.3.4" "pillow==13.0.0"
+      - name: "Every region's coverage file from all of its fragments"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          mkdir -p frags/_cells out
+          aws s3 sync "s3://$BUCKET/$PREFIX/_cells/" frags/_cells/ --endpoint-url "$R2" --only-show-errors
+          python tools/build_aerial_packs.py out --merge frags
+          aws s3 cp out/cov "s3://$BUCKET/$PREFIX/cov" --recursive --endpoint-url "$R2" --only-show-errors \
+            --content-type application/json --cache-control "public, max-age=300"
+          echo "$(find out/cov -name '*.json' | wc -l) region files, $(ls frags/_cells | wc -l) cells" | tee -a "$GITHUB_STEP_SUMMARY"

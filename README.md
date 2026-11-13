@@ -75,6 +75,17 @@ sources, see that page) repacked as it is into packs of 8 x 8 tiles (`server/til
 and `release.json`. Mapterhorn allows storing and redistributing its tiles with attribution; BeamNG.Earth reads them
 for zooms 0-12 when `cdn.json` turns `"dem"` -> `"bngmt"` on, and asks tiles.mapterhorn.com only for deeper zooms.
 
+## aerial/: 1 m aerial photo packs (tile host only, workflow "aerial"; not built yet)
+
+AVIF 4:4:4 tiles (q60) of zooms 17..14 in packs of 8 x 8 (`server/tilepack.py`) under `aerial/v1/g<gen>/{z}/{px}/{py}.bngp`,
+with one coverage file per zoom-6 region (`aerial/v1/cov/<x>/<y>.json`: which zoom-11 cells hold which packs) rebuilt
+from per-cell fragments (`aerial/v1/_cells/`). Built by `tools/build_aerial_packs.py` (a pinned copy from BeamNG.Earth)
+from openly licensed photos only: USDA NAIP through Microsoft's Planetary Computer (public domain; "USDA Farm
+Production and Conservation Business Center"). The prebaked set (US / open-Europe metro areas and main road corridors,
+`aerial/sets/*.npz`, from US Census 2020 urban areas, TIGER primary roads, GHSL GHS-SMOD 2020 (CC BY 4.0) and Natural
+Earth roads) is built here; other places are built on demand by the project's mini PC. BeamNG.Earth reads them when
+`cdn.json` turns `"imagery"` -> `"bngaer"` on.
+
 ## addons.json: the in-game Add-ons page's list (edited by hand)
 The add-ons BeamNG.Earth's Add-ons page offers and lets players install (server/addons.py, REGISTRY_URL; read through
 raw.githubusercontent.com, not the Pages site, so editing it needs no data build). Every edit reaches players within a
