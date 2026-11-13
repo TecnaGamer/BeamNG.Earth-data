@@ -33,6 +33,28 @@ paint the road markings lane by lane and give the traffic the same lanes. Built 
 [Open Database License 1.0](https://opendatacommons.org/licenses/odbl/1-0/). See
 https://www.openstreetmap.org/copyright.
 
+## routes/: US road-route membership (weekly)
+
+`routes/manifest.json` describes a gzip-compressed, content-addressed SQLite index
+of OpenStreetMap US road-route relations and their way memberships. It preserves
+network, reference, modifiers, direction and member roles, including concurrent
+routes; it contains no geometry or sign positions. The manifest includes the dated
+planet source URL, database SHA-256/size, counts, build time and ODbL attribution.
+
+`tools/build_route_relation_index.py` reads the same dated planet selected by the
+weekly data workflow in one relation-only pass. Its own code lives in this repo,
+so this dataset can be built before the corresponding application changes merge.
+It streams the planet without storing it and rejects truncated or empty builds.
+The existing site/mirror steps publish it to Pages and the tile host. A failed
+route job leaves that optional dataset out while rail/lane publication continues;
+clients retain their last valid cached index and retry later.
+
+Build: `python tools/build_route_relation_index.py PLANET.osm.pbf out/routes`
+(also accepts a streamed HTTPS URL on Linux). Tests:
+`python -m unittest discover -s tests -v` after installing `osmium==4.3.2`.
+
+**License:** © OpenStreetMap contributors, [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1-0/).
+
 ## stations/: OpenStreetMap's fuel and charging stations (weekly)
 
 `stations/<x>/<y>.json.gz` per zoom-7 tile: every `amenity=fuel` and `amenity=charging_station` (a node, or a way's
