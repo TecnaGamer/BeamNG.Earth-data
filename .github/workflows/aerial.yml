@@ -1,18 +1,25 @@
 # BeamNG.Earth's 1 m aerial photo packs (imagery source "bngaer", server/aerialpacks.py): AVIF 4:4:4 tiles in BNGP
 # packs (server/tilepack.py) of zooms 17..14 on the tile host (Cloudflare R2 bnge-tiles, tiles.tgforever.net/aerial/v1/),
-# built by tools/build_aerial_packs.py (a PINNED copy from BeamNG.Earth: this job holds the R2 secrets, so it never
-# fetches code from another repo) from openly licensed photos only (USDA NAIP via the Planetary Computer: public domain).
-# The prebaked set (metro areas + main road corridors; aerial/sets/*.npz from the prebake study) is built here; the rest
-# is built on demand by the mini PC (the same builder). Manual only: Actions -> aerial -> Run workflow. Players use the
-# packs only when cdn.json turns "bngaer" on.
-#   set:      a file of aerial/sets/ without .npz (us_T5, us_T6, ...: zoom-14 tiles x, y; adm (state); cls)
-#   adm:      only these states / countries ("MD DC VA"), blank: the whole set
-#   gen:      the build generation (packs under g<gen>/; a cell built at this generation before is skipped)
-#   ratio:    the overview read for core / urban packs (1.0: the finest at <= the zoom-17 texel)
-#   ratio_corr: ... for corridor packs (1.3: NAIP's 1.2 m overview where it is 0.6 m: a quarter of the bytes read)
-# Resumable: every built cell leaves a fragment aerial/v1/_cells/<x>_<y>.json; a job past its time budget leaves the
-# rest for the next run with the same inputs (the plan skips cells with a fragment of this generation). The coverage
-# job rebuilds the touched regions' files aerial/v1/cov/<rx>/<ry>.json from ALL their fragments (the mini PC's too).
+# built by tools/build_aerial_packs.py (a pinned copy from BeamNG.Earth) from openly licensed photos only: USDA NAIP via
+# Microsoft's Planetary Computer (public domain; its anonymous SAS token). The prebaked set (metro areas + main road
+# corridors; aerial/sets/*.npz from the prebake study) is built here; the rest is built on demand by the mini PC (the
+# same builder). Manual only: Actions -> aerial -> Run workflow. Players use the packs only when cdn.json turns
+# "bngaer" on.
+#   set:        a file of aerial/sets/ without .npz (us_T6 ...: zoom-14 tiles x, y; adm (state); cls core/urban/corr)
+#   adm:        only these states ("MD DC VA"), blank: the whole set
+#   gen:        the build generation (packs under g<gen>/; a cell built at this generation before is skipped)
+#   jobs:       build jobs (20 run at once; each up to ~5 h)
+#   max_cells:  at most this many zoom-11 cells (~15 km squares) a job, 0: as many as its time allows
+#   ratio:      the overview read for core / urban packs (1.0: NAIP's 0.6 m at the zoom-17 texel)
+#   ratio_corr: ... for corridor packs (1.3: NAIP's 1.2 m overview: a quarter of the bytes read)
+#   dry_run:    two small cells of the set, built only (the artifact kept 3 days): nothing uploaded, no secrets used
+# Security: the jobs that build (the builder, Pillow, rasterio's GDAL, the photos) hold no secrets; the jobs holding the
+# R2 secrets run only this repo's tools/aerial_ci.py (standard library: every file of a build's artifact checked, a pack's
+# header against its path, a cell's fragment against the packs on hand) and aws-cli.
+# Resumable: every built cell leaves a fragment aerial/v1/_cells/<x>_<y>.json, uploaded after its packs; the plan skips
+# cells with a fragment of this generation listing every pack of the set there, so running the workflow again with the
+# same inputs builds the rest. The coverage job rebuilds the region files aerial/v1/cov/<rx>/<ry>.json from ALL the
+# fragments (the mini PC's too), last.
 # Secrets (repo settings): R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.
 name: aerial
 
@@ -20,176 +27,149 @@ on:
   workflow_dispatch:
     inputs:
       set:
-        description: "aerial/sets/<set>.npz (us_T5, us_T6, eu_core_T6, ...)"
-        default: "us_T5"
+        description: "aerial/sets/<set>.npz (us_T6, us_T5, ...)"
+        default: "us_T6"
       adm:
-        description: 'states / countries ("MD DC"), blank: all'
+        description: 'states ("MD DC"), blank: all of the set'
         default: ""
       gen:
         description: "build generation"
         default: "1"
+      jobs:
+        description: "build jobs (20 at once)"
+        default: "20"
+      max_cells:
+        description: "cells a job at most (0: its time budget decides)"
+        default: "0"
       ratio:
         description: "overview ratio, core / urban packs"
         default: "1.0"
       ratio_corr:
         description: "overview ratio, corridor packs"
         default: "1.3"
+      workers:
+        description: "build processes per job (4 vCPUs)"
+        default: "6"
+      dry_run:
+        description: "two small cells, built only: no upload"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
-env:
-  BUCKET: bnge-tiles
-  PREFIX: aerial/v1
+concurrency:
+  group: aerial
+  cancel-in-progress: false
 
 jobs:
-  plan:
+  fragments:
+    # (secrets: aws-cli only) the cells built before
+    if: ${{ github.event.inputs.dry_run != 'true' }}
     runs-on: ubuntu-latest
-    outputs:
-      chunks: ${{ steps.plan.outputs.chunks }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install "numpy==2.3.4"
-      - name: "Cells done before (their fragments of this generation)"
-        env:
+      - env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
         run: |
-          mkdir -p frags
-          aws s3 sync "s3://$BUCKET/$PREFIX/_cells/" frags/ --endpoint-url "$R2" --only-show-errors || true
+          set -euo pipefail
+          mkdir -p frags/_cells
+          aws configure set default.s3.max_concurrent_requests 32
+          aws s3 sync s3://bnge-tiles/aerial/v1/_cells/ frags/_cells/ --endpoint-url "$R2" --only-show-errors
+          tar czf frags.tgz -C frags _cells
+          echo "$(ls frags/_cells | wc -l) fragments"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: fragments
+          path: frags.tgz
+          retention-days: 3
+
+  plan:
+    needs: fragments
+    if: ${{ !cancelled() && needs.fragments.result != 'failure' }}
+    runs-on: ubuntu-latest
+    outputs:
+      chunks: ${{ steps.plan.outputs.chunks }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q "numpy==2.3.4"
+      - if: ${{ needs.fragments.result == 'success' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: fragments
       - id: plan
-        name: "The set's cells, by state, in chunks of about equal packs"
+        name: "The set's cells still to build, in chunks of about equal packs"
         env:
           SET: ${{ github.event.inputs.set }}
           ADM: ${{ github.event.inputs.adm }}
           GEN: ${{ github.event.inputs.gen }}
+          JOBS: ${{ github.event.inputs.jobs }}
+          MAX_CELLS: ${{ github.event.inputs.max_cells }}
+          DRY: ${{ github.event.inputs.dry_run }}
         run: |
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json, os, re
-          import numpy as np
-          s = os.environ["SET"].strip()
-          if not re.fullmatch(r"[a-z]{2}(_[a-z]+)?_T[0-9a-z]+", s):
-              raise SystemExit(f"bad set: {s!r}")
-          adm = set(os.environ.get("ADM", "").split())
-          if not all(re.fullmatch(r"[A-Z]{2}", a) for a in adm):
-              raise SystemExit("bad adm")
-          gen = int(os.environ["GEN"])
-          d = np.load(f"aerial/sets/{s}.npz", allow_pickle=False)
-          done = set()
-          for n in os.listdir("frags"):
-              try:
-                  f = json.load(open(os.path.join("frags", n)))
-                  if int(f.get("g", 0)) >= gen or not f.get("p"):
-                      done.add(tuple(f["cell"]))
-              except Exception:
-                  pass
-          cells = {}
-          for x, y, a in zip(d["x"].tolist(), d["y"].tolist(), d["adm"].tolist()):
-              if adm and a not in adm:
-                  continue
-              c = (x >> 3, y >> 3)
-              if c not in done:
-                  cells[c] = cells.get(c, 0) + 1
-          n = max(1, min(250, len(cells) // 4 or 1))
-          bins = [[0, []] for _ in range(n)]
-          for c, w in sorted(cells.items(), key=lambda kv: -kv[1]):
-              b = min(bins, key=lambda b: b[0])
-              b[0] += w + 21               # (+ the cell's zooms 16..14)
-              b[1].append(c)
-          chunks = [" ".join(f"{x},{y}" for x, y in sorted(b[1])) for b in bins if b[1]]
-          print("chunks=" + json.dumps(chunks))
-          PY
-        shell: bash
+          set -euo pipefail
+          [[ "$GEN" =~ ^[0-9]+$ && "$JOBS" =~ ^[0-9]+$ && "$MAX_CELLS" =~ ^[0-9]+$ ]]
+          mkdir -p frags; if [ -f frags.tgz ]; then tar xzf frags.tgz -C frags; fi
+          D=(); [ "$DRY" = "true" ] && D=(--dry-run)
+          python tools/aerial_ci.py plan --set "$SET" --adm "$ADM" --gen "$GEN" --frags frags --jobs "$JOBS" \
+            --max-cells "$MAX_CELLS" "${D[@]}" 2> plan.log > plan.json
+          cat plan.log | tee -a "$GITHUB_STEP_SUMMARY"
+          python -c 'import json; print("chunks=" + json.dumps(json.load(open("plan.json"))["chunks"], separators=(",", ":")))' >> "$GITHUB_OUTPUT"
 
   build:
     needs: plan
-    if: ${{ needs.plan.outputs.chunks != '[]' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 355
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.chunks != '[]' }}
     strategy:
       fail-fast: false
       max-parallel: 20
       matrix:
         chunk: ${{ fromJson(needs.plan.outputs.chunks) }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      # (pinned: this job holds the R2 secrets; Pillow's wheels carry libavif with aom, rasterio's GDAL)
-      - run: pip install "numpy==2.3.4" "pillow==13.0.0" "rasterio==1.5.2"
-      - name: "The builder (tools/build_aerial_packs.py, server/tilepack.py: copies from BeamNG.Earth in this repo)"
-        run: test -f tools/build_aerial_packs.py && test -f server/tilepack.py
-      - name: Build and upload the chunk's cells
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
-          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
-          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-          CHUNK: ${{ matrix.chunk }}
-          SET: ${{ github.event.inputs.set }}
-          GEN: ${{ github.event.inputs.gen }}
-          RATIO: ${{ github.event.inputs.ratio }}
-          RATIO_CORR: ${{ github.event.inputs.ratio_corr }}
-        run: |
-          set -euo pipefail
-          DEADLINE=$(( $(date +%s) + 320 * 60 ))
-          META=(--content-type application/octet-stream --cache-control "public, max-age=31536000, immutable")
-          ( while sleep 300; do
-              echo "[mon] load $(cut -d' ' -f1-3 /proc/loadavg), $(free -m | awk '/Mem/ {print $3}') MB used, $(df -m . | awk 'NR == 2 {print $4}') MB free"
-            done ) &
-          MON=$!
-          trap 'kill $MON 2>/dev/null || true' EXIT
-          for c in $CHUNK; do
-            if [ "$(date +%s)" -gt "$DEADLINE" ]; then echo "cell $c: left for the next run (time)"; continue; fi
-            rm -rf out && mkdir out
-            set +e
-            python tools/build_aerial_packs.py out --packs "aerial/sets/$SET.npz" --only-cells "$c" --gen "$GEN" \
-              --res-ratio "$RATIO" --res-ratio-corr "$RATIO_CORR" --workers 6 --fragments --deadline "$DEADLINE"
-            st=$?
-            set -e
-            if [ -d "out/g$GEN" ]; then
-              for i in 1 2 3 4; do
-                aws s3 cp "out/g$GEN" "s3://$BUCKET/$PREFIX/g$GEN" --recursive --exclude "*.tmp" \
-                  --endpoint-url "$R2" --only-show-errors "${META[@]}" && break
-                echo "upload try $i failed"; sleep $((20 * i))
-              done
-            fi
-            # the fragment last: a cell is done only once its packs are up
-            if [ "$st" -eq 0 ] && [ -d out/_cells ]; then
-              aws s3 cp out/_cells "s3://$BUCKET/$PREFIX/_cells" --recursive --endpoint-url "$R2" --only-show-errors \
-                --content-type application/json --cache-control "no-cache"
-            fi
-            echo "cell $c: status $st, $(du -sm out | cut -f1) MB"
-          done
+    permissions:
+      contents: read
+      actions: write          # (the upload job deletes its build job's artifact once it is in the bucket)
+    uses: ./.github/workflows/aerial-chunk.yml
+    with:
+      id: ${{ matrix.chunk.i }}
+      cells: ${{ matrix.chunk.cells }}
+      set: ${{ github.event.inputs.set }}
+      gen: ${{ github.event.inputs.gen }}
+      ratio: ${{ github.event.inputs.ratio }}
+      ratio_corr: ${{ github.event.inputs.ratio_corr }}
+      workers: ${{ github.event.inputs.workers }}
+      dry_run: ${{ github.event.inputs.dry_run == 'true' }}
+    secrets:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
 
   coverage:
+    # (secrets: this repo's merge and aws-cli only) every region file from all of its fragments, last
     needs: [plan, build]
-    if: ${{ always() && needs.plan.outputs.chunks != '[]' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.chunks != '[]' && github.event.inputs.dry_run != 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
         with:
-          python-version: "3.12"
-      - run: pip install "numpy==2.3.4" "pillow==13.0.0"
-      - name: "Every region's coverage file from all of its fragments"
-        env:
+          persist-credentials: false
+      - env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
         run: |
+          set -euo pipefail
           mkdir -p frags/_cells out
-          aws s3 sync "s3://$BUCKET/$PREFIX/_cells/" frags/_cells/ --endpoint-url "$R2" --only-show-errors
-          python tools/build_aerial_packs.py out --merge frags
-          aws s3 cp out/cov "s3://$BUCKET/$PREFIX/cov" --recursive --endpoint-url "$R2" --only-show-errors \
-            --content-type application/json --cache-control "public, max-age=300"
-          echo "$(find out/cov -name '*.json' | wc -l) region files, $(ls frags/_cells | wc -l) cells" | tee -a "$GITHUB_STEP_SUMMARY"
+          aws configure set default.s3.max_concurrent_requests 32
+          aws s3 sync s3://bnge-tiles/aerial/v1/_cells/ frags/_cells/ --endpoint-url "$R2" --only-show-errors
+          python3 tools/aerial_ci.py merge frags out | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ -d out/cov ]; then
+            aws s3 cp out/cov s3://bnge-tiles/aerial/v1/cov --recursive --endpoint-url "$R2" --only-show-errors \
+              --content-type application/json --cache-control "public, max-age=300"
+          fi

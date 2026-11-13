@@ -259,9 +259,17 @@ def build_top_pack(job):
             dict(read_s=t1 - t0, enc_s=t2 - t1, years=sorted(set(used)), read_m=sorted(set(round(r, 2) for r in read_m))))
 
 
-def build_low_packs(cx, cy, canvas, cfill, quality, speed):
-    """The cell's zoom-16 .. 14 packs from its zoom-16 canvas (8192 px; filled mask): {(z, px, py): bytes}."""
-    out = {}
+def _encode_low(job):
+    """Worker: one zoom-16 .. 14 pack."""
+    z, px, py, img, fill, quality, speed = job
+    return (z, px, py), encode_pack(z, px, py, img, fill, quality, speed)
+
+
+def build_low_packs(cx, cy, canvas, cfill, quality, speed, pool=None):
+    """The cell's zoom-16 .. 14 packs from its zoom-16 canvas (8192 px; filled mask): {(z, px, py): bytes}. With a
+    pool, the packs are encoded by its workers (21 packs, 1,344 tiles a whole cell: ~a third of a cell's encoding,
+    serial before: 34-66 s of a 120-177 s cell, 2026-11-13)."""
+    jobs = []
     img, fill = canvas, cfill
     for z in range(Z_TOP - 1, Z_LOW - 1, -1):
         n = img.shape[0] // PACK_PX
@@ -271,13 +279,11 @@ def build_low_packs(cx, cy, canvas, cfill, quality, speed):
                 if not fill[sl].any():
                     continue
                 px, py = (cx << (z - K - CELL_Z)) + i, (cy << (z - K - CELL_Z)) + j
-                d = encode_pack(z, px, py, img[sl], fill[sl], quality, speed)
-                if d:
-                    out[(z, px, py)] = d
+                jobs.append((z, px, py, np.ascontiguousarray(img[sl]), np.ascontiguousarray(fill[sl]), quality, speed))
         if z > Z_LOW:
             img = np.asarray(Image.fromarray(img).reduce(2))
             fill = fill.reshape(fill.shape[0] // 2, 2, fill.shape[1] // 2, 2).any(axis=(1, 3))
-    return out
+    return {k: d for k, d in (pool.map(_encode_low, jobs) if pool else map(_encode_low, jobs)) if d}
 
 
 # --- coverage ----------------------------------------------------------------------------------------------------
@@ -409,8 +415,8 @@ def build_cell(args, src, cx, cy, packs):
             sl = (slice(j * PACK_PX // 2, (j + 1) * PACK_PX // 2), slice(i * PACK_PX // 2, (i + 1) * PACK_PX // 2))
             canvas[sl] = half
             cfill[sl] = hf
-    t1 = time.time()
-    low = build_low_packs(cx, cy, canvas, cfill, args.quality, args.speed) if mask else {}
+        t1 = time.time()
+        low = build_low_packs(cx, cy, canvas, cfill, args.quality, args.speed, pool) if mask else {}
     for (z, px, py), d in low.items():
         nbytes += write(args.out, args.gen, z, px, py, d)
     t2 = time.time()
