@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: read
+  actions: read   # (deploy: an optional job that failed keeps its last good artifact)
   pages: write
   id-token: write
 
@@ -102,6 +103,11 @@ jobs:
                    server/milemarkers.py server/routeshields.py server/signshards.py; do
             curl -sfL -o "$(basename "$f")" "$B/$f"
           done
+          # (the sign modules' deterministic maths, dmath / dnp, call BeamNG.Earth's native module; this one CI build
+          # makes the one file every player reads, so math and numpy stand in for them here: without these the job
+          # failed from 2026-11-13 on, BeamNG.Earth #1169)
+          printf 'import math\n\n\ndef __getattr__(n):\n    return getattr(math, n)\n' > dmath.py
+          printf 'import numpy as np\n\n\ndef __getattr__(n):\n    return getattr(np, n) if hasattr(np, n) else getattr(np.linalg, n)\n' > dnp.py
       - name: Build
         run: |
           python build_sign_tags.py "${{ needs.planet.outputs.url }}" out/signs
@@ -110,7 +116,30 @@ jobs:
         with:
           name: signs
           path: out
-          retention-days: 3
+          retention-days: 14   # (> a week: the deploy reuses the last good one when this job fails)
+
+  routes:
+    # US road-route identities and way memberships only (no geometry or sign positions), for the US route shields:
+    # tools/build_route_relation_index.py (data PR #4, wyo-backroads, ported). Optional like the signs.
+    needs: planet
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tools
+        run: pip install "osmium==4.3.2"
+      - name: Builder tests
+        run: python -m unittest discover -s tests -v
+      - name: Build
+        run: python tools/build_route_relation_index.py "${{ needs.planet.outputs.url }}" out/routes
+      - uses: actions/upload-artifact@v4
+        with:
+          name: routes
+          path: out
+          retention-days: 14   # (> a week: the deploy reuses the last good one when this job fails)
 
   osmtags:
     # OpenStreetMap's road tags (lanes, width, speed limit, sidewalk, surface ...) of OSM US's Layercake highways file,
@@ -184,7 +213,145 @@ jobs:
         with:
           name: osmtags
           path: out
-          retention-days: 3
+          retention-days: 14   # (> a week: the deploy reuses the last good one when this job fails)
+
+  osmyears:
+    # OpenStreetMap's building construction years (start_date) of OSM US's Layercake buildings file, one blob per
+    # zoom-12 tile in PMTiles archive parts (BeamNG.Earth tools/build_osm_building_years.py, read by
+    # server/osmyears.py: pre-war towers drawn in masonry, not glass). A copy in this repo, as osmtags' builder: this
+    # job holds the R2 secrets, so it runs no code fetched from elsewhere. Each build's parts go to the tile host in
+    # a folder of their own (osmyears/<key>/, never overwritten: a running server keeps reading the build it started
+    # on), each checked against the manifest's SHA-256 first; only the manifest is published on Pages, pointing at
+    # them, after the parts. Optional: without it the towers are drawn as before.
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tools
+        run: pip install "duckdb==1.5.6" numpy
+      - name: Build
+        run: |
+          python tools/build_osm_building_years.py https://data.openstreetmap.us/layercake/buildings.parquet \
+            out/osmyears --workers 3
+      - name: The parts to the tile host, the manifest pointing at them
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (see the osmtags job)
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          D=out/osmyears
+          KEY=$(python -c "import json, re, sys; k = json.load(open('$D/manifest.json'))['key']; assert re.fullmatch(r'[0-9A-Za-z_.-]{4,80}', k); print(k)")
+          ls -l "$D" "$D/$KEY"
+          python - "$D/manifest.json" <<'PY'
+          import hashlib, json, os, sys
+          d = os.path.dirname(sys.argv[1])
+          m = json.load(open(sys.argv[1]))
+          assert m["parts"], "no parts"
+          for p in m["parts"]:
+              assert p["archive"].startswith(m["key"] + "/"), p["archive"]
+              b = open(os.path.join(d, p["archive"]), "rb").read()
+              assert len(b) == p["bytes"] and hashlib.sha256(b).hexdigest() == p["sha256"], p["archive"]
+              assert len(b) < 536870912, p["archive"]     # (Cloudflare's free plan caches files up to 512 MB)
+          print(len(m["parts"]), "parts checked")
+          PY
+          for f in "$D/$KEY"/osmyears*.pmtiles; do
+            for try in 1 2 3; do
+              aws s3 cp "$f" "s3://bnge-tiles/osmyears/$KEY/$(basename "$f")" --endpoint-url "$R2" --only-show-errors \
+                --content-type application/octet-stream --cache-control "public, max-age=31536000, immutable" && break
+              test "$try" -lt 3; sleep $((try * 20))
+            done
+          done
+          python - "$D/manifest.json" "https://tiles.tgforever.net/osmyears" <<'PY'
+          import json, sys
+          m = json.load(open(sys.argv[1]))
+          for p in m["parts"]:
+              p["archive"] = f"{sys.argv[2]}/{p['archive']}"
+          json.dump(m, open(sys.argv[1], "w"), separators=(",", ":"))
+          PY
+          rm -r "$D/$KEY"
+          mkdir -p pub && cp -r "$D" pub/
+          head -c 1200 pub/osmyears/manifest.json; echo
+      - uses: actions/upload-artifact@v4
+        with:
+          name: osmyears
+          path: pub
+          retention-days: 14   # (> a week: the deploy reuses the last good one when this job fails)
+
+  osmcolours:
+    # OpenStreetMap's mapped colours of buildings and building parts (building:colour, roof:colour) as RGB, from the
+    # newest planet (streamed three times by curl: nothing stored), one blob per zoom-12 tile in PMTiles archive parts
+    # (BeamNG.Earth tools/build_osm_building_colours.py, read by server/osmcolours.py: the colours Overture drops,
+    # filled only where its own are empty). Pinned copies in this repo (with build_osm_building_years.py and
+    # build_osm_tag_shards.py, which write its parts): this job holds the R2 secrets, so it runs no code fetched from
+    # elsewhere (the planet is data). The parts and the manifest as osmyears': each build's parts in a folder of their
+    # own (osmcolours/<key>/, never overwritten), each checked against the manifest's size and SHA-256 first, the
+    # manifest on Pages pointing at them, after the parts. Optional: without it the buildings keep Overture's colours.
+    needs: planet
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tools
+        run: pip install "osmium==4.3.2" numpy
+      - name: Build
+        run: |
+          python tools/build_osm_building_colours.py "${{ needs.planet.outputs.url }}" out/osmcolours
+      - name: The parts to the tile host, the manifest pointing at them
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (see the osmtags job)
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          D=out/osmcolours
+          KEY=$(python -c "import json, re, sys; k = json.load(open('$D/manifest.json'))['key']; assert re.fullmatch(r'[0-9A-Za-z_.-]{4,80}', k); print(k)")
+          ls -l "$D" "$D/$KEY"
+          python - "$D/manifest.json" <<'PY'
+          import hashlib, json, os, sys
+          d = os.path.dirname(sys.argv[1])
+          m = json.load(open(sys.argv[1]))
+          assert m["parts"], "no parts"
+          for p in m["parts"]:
+              assert p["archive"].startswith(m["key"] + "/"), p["archive"]
+              b = open(os.path.join(d, p["archive"]), "rb").read()
+              assert len(b) == p["bytes"] and hashlib.sha256(b).hexdigest() == p["sha256"], p["archive"]
+              assert len(b) < 536870912, p["archive"]     # (Cloudflare's free plan caches files up to 512 MB)
+          print(len(m["parts"]), "parts checked,", m["rows"], "rows,", m["facade"], "facade,", m["roof"], "roof colours,",
+                m["unread"], "values not read")
+          PY
+          for f in "$D/$KEY"/osmcolours*.pmtiles; do
+            for try in 1 2 3; do
+              aws s3 cp "$f" "s3://bnge-tiles/osmcolours/$KEY/$(basename "$f")" --endpoint-url "$R2" --only-show-errors \
+                --content-type application/octet-stream --cache-control "public, max-age=31536000, immutable" && break
+              test "$try" -lt 3; sleep $((try * 20))
+            done
+          done
+          python - "$D/manifest.json" "https://tiles.tgforever.net/osmcolours" <<'PY'
+          import json, sys
+          m = json.load(open(sys.argv[1]))
+          for p in m["parts"]:
+              p["archive"] = f"{sys.argv[2]}/{p['archive']}"
+          json.dump(m, open(sys.argv[1], "w"), separators=(",", ":"))
+          PY
+          rm -r "$D/$KEY"
+          mkdir -p pub && cp -r "$D" pub/
+          head -c 1200 pub/osmcolours/manifest.json; echo
+      - uses: actions/upload-artifact@v4
+        with:
+          name: osmcolours
+          path: pub
+          retention-days: 14   # (> a week: the deploy reuses the last good one when this job fails)
 
   stations:
     # OpenStreetMap's fuel and charging stations with their capacity, and the charge points (stations/, read by
@@ -212,7 +379,91 @@ jobs:
         with:
           name: stations
           path: out
-          retention-days: 3
+          retention-days: 14   # (> a week: the deploy reuses the last good one when this job fails)
+
+  tallbld:
+    # The tall-building index for the horizon ring (BeamNG.Earth tools/build_tall_index.py, read by server/bldhz.py):
+    # every Overture building at least 60 m tall (its height, its storeys or one of its parts) with all its parts, one
+    # blob a zoom-12 tile, in PMTiles archive parts. From the Overture release pinned here (tools/overture_stac_*.json.gz:
+    # its file list): the files' footers first (tail reads, cached by release), then only the row groups whose
+    # statistics may hold a tall building (~7.6k row groups, ~23 GB of ranges from Overture's S3, into sparse files
+    # under /mnt). A pinned copy in this repo, as osmyears' builder: this job holds the R2 secrets, so it runs no code
+    # fetched from elsewhere. The parts and the manifest as osmyears': each build's parts in a folder of their own
+    # (tallbld/<key>/, never overwritten), each checked against the manifest's size and SHA-256 first, the manifest on
+    # Pages pointing at them, after the parts. Optional: without it there are no buildings past the skyline.
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tools
+        run: pip install "duckdb==1.5.6" numpy
+      - name: The release
+        id: rel
+        run: |
+          S=$(ls tools/overture_stac_*.json.gz | sort | tail -1)
+          echo "stac=$S" >> "$GITHUB_OUTPUT"
+          echo "release=$(basename "$S" .json.gz | sed 's/^overture_stac_//')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: footers
+          key: tallbld-footers-${{ steps.rel.outputs.release }}
+      - name: Build
+        run: |
+          sudo mkdir -p /mnt/tallwork && sudo chown "$USER" /mnt/tallwork
+          df -h / /mnt
+          python tools/build_tall_index.py --stac "${{ steps.rel.outputs.stac }}" --footers footers --fetch-footers
+          python tools/build_tall_index.py --stac "${{ steps.rel.outputs.stac }}" --footers footers \
+            --work /mnt/tallwork --world --pages out/tallbld
+          sudo rm -rf /mnt/tallwork   # (/mnt is root's: the folder itself goes with sudo)
+      - name: The parts to the tile host, the manifest pointing at them
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (see the osmtags job)
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          D=out/tallbld
+          KEY=$(python -c "import json, re, sys; k = json.load(open('$D/manifest.json'))['key']; assert re.fullmatch(r'[0-9A-Za-z_.-]{4,80}', k); print(k)")
+          ls -l "$D" "$D/$KEY"
+          python - "$D/manifest.json" <<'PY'
+          import hashlib, json, os, sys
+          d = os.path.dirname(sys.argv[1])
+          m = json.load(open(sys.argv[1]))
+          assert m["parts"], "no parts"
+          for p in m["parts"]:
+              assert p["archive"].startswith(m["key"] + "/"), p["archive"]
+              b = open(os.path.join(d, p["archive"]), "rb").read()
+              assert len(b) == p["bytes"] and hashlib.sha256(b).hexdigest() == p["sha256"], p["archive"]
+              assert len(b) < 536870912, p["archive"]     # (Cloudflare's free plan caches files up to 512 MB)
+          print(len(m["parts"]), "parts checked")
+          PY
+          for f in "$D/$KEY"/tallbld*.pmtiles; do
+            for try in 1 2 3; do
+              aws s3 cp "$f" "s3://bnge-tiles/tallbld/$KEY/$(basename "$f")" --endpoint-url "$R2" --only-show-errors \
+                --content-type application/octet-stream --cache-control "public, max-age=31536000, immutable" && break
+              test "$try" -lt 3; sleep $((try * 20))
+            done
+          done
+          python - "$D/manifest.json" "https://tiles.tgforever.net/tallbld" <<'PY'
+          import json, sys
+          m = json.load(open(sys.argv[1]))
+          for p in m["parts"]:
+              p["archive"] = f"{sys.argv[2]}/{p['archive']}"
+          json.dump(m, open(sys.argv[1], "w"), separators=(",", ":"))
+          PY
+          rm -r "$D/$KEY"
+          mkdir -p pub && cp -r "$D" pub/
+          head -c 1200 pub/tallbld/manifest.json; echo
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tallbld
+          path: pub
+          retention-days: 14   # (> a week: the deploy reuses the last good one when this job fails)
 
   nl-rvv:
     # Optional until the producer in application PR #1214 has merged into dev.
@@ -280,9 +531,9 @@ jobs:
           retention-days: 3
 
   site:
-    needs: [rail, lanes, signs, osmtags, stations, nl-rvv, nl-signal-context]
+    needs: [rail, lanes, signs, osmtags, osmyears, osmcolours, stations, tallbld, routes, nl-rvv, nl-signal-context]
     # (the sign shards, the OSM road tags and the stations are optional: a failed signs / osmtags / stations job leaves
-    # them out, the rail and lane data still publish)
+    # them out, the rail and lane data still publish; osmyears and osmcolours likewise)
     if: ${{ !cancelled() && needs.rail.result == 'success' && needs.lanes.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
@@ -295,11 +546,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p site
+          # an optional job that failed this time: its last good artifact from an earlier run instead (a deploy
+          # replaces the whole site, so a failed signs job took the sign shards off Pages from 2026-11-13 on)
+          for n in signs osmtags osmyears osmcolours tallbld stations routes; do
+            [ -d "parts/$n" ] && continue
+            id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$n&per_page=20" -q '[.artifacts[] | select(.expired | not)][0].workflow_run.id // empty' || true)
+            if [ -n "$id" ] && gh run download "$id" -R "$GITHUB_REPOSITORY" -n "$n" -D "parts/$n"; then
+              echo "$n: this run's job failed; the artifact of run $id instead"; fi
+          done
           cp -r parts/rail/* site/
           cp -r parts/lanes/* site/
           if [ -d parts/signs ]; then cp -r parts/signs/* site/; fi
           if [ -d parts/osmtags ]; then cp -r parts/osmtags/* site/; fi
+          if [ -d parts/osmyears ]; then cp -r parts/osmyears/* site/; fi
+          if [ -d parts/osmcolours ]; then cp -r parts/osmcolours/* site/; fi
+          if [ -d parts/tallbld ]; then cp -r parts/tallbld/* site/; fi
           if [ -d parts/stations ]; then cp -r parts/stations/* site/; fi
+          if [ -d parts/routes ]; then cp -r parts/routes/* site/; fi
           # Recheck with this repository's own code before the existing mirror
           # job sees the files. A failed optional Dutch dataset never blocks rail/lanes.
           if [ -d parts/nl-rvv/nl-rvv ] && python3 tools/nl_roadside_ci.py parts/nl-rvv/nl-rvv; then
@@ -342,7 +605,7 @@ jobs:
             rm -f parts/de-roads-16-states.tar; echo "deroads: not published this run"; fi
           du -sh site; du -sh site/* | sort -h | tail -8
           cp README.md site/
-          printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>, lane-level road tags: <a href="lanes/manifest.json">lanes/manifest.json</a>, highway sign sources: <a href="signs/manifest.json">signs/manifest.json</a>, fuel and charging stations: <a href="stations/manifest.json">stations/manifest.json</a>, level crossings (US): <a href="fra/manifest.json">fra/manifest.json</a>, measured German roofs: <a href="lod2/manifest.json">lod2/manifest.json</a> (sources and licences: <a href="lod2/ATTRIBUTION.md">lod2/ATTRIBUTION.md</a>), surveyed German roads: <a href="deroads/ATTRIBUTION.md">deroads/ATTRIBUTION.md</a>, measured roofs of Switzerland, Estonia and Vienna: <a href="lod2-ch/ATTRIBUTION.md">lod2-ch</a>, <a href="lod2-ee/ATTRIBUTION.md">lod2-ee</a>, <a href="lod2-wien/ATTRIBUTION.md">lod2-wien</a>, New York building massing: <a href="nycmassing/v1/manifest.json">nycmassing/v1/manifest.json</a> (<a href="nycmassing/ATTRIBUTION.md">nycmassing/ATTRIBUTION.md</a>). Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
+          printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>, lane-level road tags: <a href="lanes/manifest.json">lanes/manifest.json</a>, highway sign sources: <a href="signs/manifest.json">signs/manifest.json</a>, US road-route membership: <a href="routes/manifest.json">routes/manifest.json</a>, fuel and charging stations: <a href="stations/manifest.json">stations/manifest.json</a>, level crossings (US): <a href="fra/manifest.json">fra/manifest.json</a>, measured German roofs: <a href="lod2/manifest.json">lod2/manifest.json</a> (sources and licences: <a href="lod2/ATTRIBUTION.md">lod2/ATTRIBUTION.md</a>), surveyed German roads: <a href="deroads/ATTRIBUTION.md">deroads/ATTRIBUTION.md</a>, measured roofs of Switzerland, Estonia and Vienna: <a href="lod2-ch/ATTRIBUTION.md">lod2-ch</a>, <a href="lod2-ee/ATTRIBUTION.md">lod2-ee</a>, <a href="lod2-wien/ATTRIBUTION.md">lod2-wien</a>, New York building massing: <a href="nycmassing/v1/manifest.json">nycmassing/v1/manifest.json</a> (<a href="nycmassing/ATTRIBUTION.md">nycmassing/ATTRIBUTION.md</a>). Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
           ls site
       - name: The datasets' files to the tile host, each manifest naming that copy ("data")
         # (players read ~1.15 TB a month of these from Pages, whose soft limit is 100 GB: BeamNG.Earth's server reads a
