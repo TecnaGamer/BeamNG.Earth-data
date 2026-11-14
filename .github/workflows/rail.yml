@@ -116,7 +116,7 @@ jobs:
         with:
           name: signs
           path: out
-          retention-days: 3
+          retention-days: 14   # (> a week: the deploy reuses the last good one when this job fails)
 
   routes:
     # US road-route identities and way memberships only (no geometry or sign positions), for the US route shields:
@@ -139,7 +139,7 @@ jobs:
         with:
           name: routes
           path: out
-          retention-days: 3
+          retention-days: 14   # (> a week: the deploy reuses the last good one when this job fails)
 
   osmtags:
     # OpenStreetMap's road tags (lanes, width, speed limit, sidewalk, surface ...) of OSM US's Layercake highways file,
@@ -213,7 +213,7 @@ jobs:
         with:
           name: osmtags
           path: out
-          retention-days: 3
+          retention-days: 14   # (> a week: the deploy reuses the last good one when this job fails)
 
   osmyears:
     # OpenStreetMap's building construction years (start_date) of OSM US's Layercake buildings file, one blob per
@@ -281,7 +281,7 @@ jobs:
         with:
           name: osmyears
           path: pub
-          retention-days: 3
+          retention-days: 14   # (> a week: the deploy reuses the last good one when this job fails)
 
   osmcolours:
     # OpenStreetMap's mapped colours of buildings and building parts (building:colour, roof:colour) as RGB, from the
@@ -351,7 +351,7 @@ jobs:
         with:
           name: osmcolours
           path: pub
-          retention-days: 3
+          retention-days: 14   # (> a week: the deploy reuses the last good one when this job fails)
 
   stations:
     # OpenStreetMap's fuel and charging stations with their capacity, and the charge points (stations/, read by
@@ -379,7 +379,7 @@ jobs:
         with:
           name: stations
           path: out
-          retention-days: 3
+          retention-days: 14   # (> a week: the deploy reuses the last good one when this job fails)
 
   tallbld:
     # The tall-building index for the horizon ring (BeamNG.Earth tools/build_tall_index.py, read by server/bldhz.py):
@@ -463,7 +463,7 @@ jobs:
         with:
           name: tallbld
           path: pub
-          retention-days: 3
+          retention-days: 14   # (> a week: the deploy reuses the last good one when this job fails)
 
   site:
     needs: [rail, lanes, signs, osmtags, osmyears, osmcolours, stations, tallbld, routes]
