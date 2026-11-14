@@ -10,6 +10,28 @@ dataset's `manifest.json` on Pages names that copy in its `"data"` field: BeamNG
 falls back to Pages. The OSM road tag archive (`osmtags/`) is on the tile host only, in parts of at most 400 MB that
 the manifest's `"parts"` list.
 
+## nl-rvv/: Dutch roadside sign attributes (optional weekly build)
+
+`nl-rvv/<x>/<y>.json.gz` per zoom-12 tile contains official NDW current-state
+roadside sign attributes: source identifiers, position, viewing direction,
+supported RVV meaning and complete supported text qualifiers. There are no sign
+photographs, vendor artwork, national CSV exports or a private store in this
+dataset. The application renders shared meshes with its own face atlas.
+
+The optional `nl-rvv` job in the existing `data` workflow uses
+`tools/build_nl_rvv.py` and `server/nlrvvdata.py` from BeamNG.Earth `dev`. It
+requires the producer from application PR #1214 to have merged there. The build
+job has read-only repository permission; this repository's own
+`tools/nl_roadside_ci.py` checks the artifact both before upload and again before
+it is merged into the existing site. The existing tile-host mirror discovers
+the new dataset by its manifest. No separate Pages deployment replaces the
+other datasets. If this optional dataset fails, rail and lane data still publish.
+
+**Licence:** NDW attribute data, CC0-1.0; the produced manifest retains the source
+export URL, source SHA-256 and NDW terms link. This licence does not cover sign
+photographs or the application's artwork. No deployment has been performed by
+the application PR.
+
 ## rail/: OpenStreetMap's railways (weekly)
 
 `rail/<x>/<y>.json.gz` per zoom-7 tile with railways: OpenStreetMap's railway tags by way id (railway, usage,

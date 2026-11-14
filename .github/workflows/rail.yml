@@ -214,8 +214,46 @@ jobs:
           path: out
           retention-days: 3
 
+  nl-rvv:
+    # Optional until the producer in application PR #1214 has merged into dev.
+    # This build job has no R2 or deployment credentials.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: data
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: TecnaGamer/BeamNG.Earth
+          ref: dev
+          path: app
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            tools/build_nl_rvv.py
+            server/nlrvvdata.py
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Official NDW current-state attributes
+        run: curl --fail --location --retry 3 --max-time 1200 --output source.csv.gz https://opendata.ndw.nu/verkeersborden_actueel_beeld.csv.gz
+      - name: Build and check attribute-only shards
+        run: |
+          python data/tools/test_nl_roadside_ci.py
+          python app/tools/build_nl_rvv.py source.csv.gz out/nl-rvv
+          python data/tools/nl_roadside_ci.py out/nl-rvv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nl-rvv
+          path: out
+          retention-days: 3
+
   site:
-    needs: [rail, lanes, signs, osmtags, stations]
+    needs: [rail, lanes, signs, osmtags, stations, nl-rvv]
     # (the sign shards, the OSM road tags and the stations are optional: a failed signs / osmtags / stations job leaves
     # them out, the rail and lane data still publish)
     if: ${{ !cancelled() && needs.rail.result == 'success' && needs.lanes.result == 'success' }}
@@ -235,6 +273,13 @@ jobs:
           if [ -d parts/signs ]; then cp -r parts/signs/* site/; fi
           if [ -d parts/osmtags ]; then cp -r parts/osmtags/* site/; fi
           if [ -d parts/stations ]; then cp -r parts/stations/* site/; fi
+          # Recheck with this repository's own code before the existing mirror
+          # job sees the files. A failed optional Dutch dataset never blocks rail/lanes.
+          if [ -d parts/nl-rvv/nl-rvv ] && python3 tools/nl_roadside_ci.py parts/nl-rvv/nl-rvv; then
+            cp -r parts/nl-rvv/nl-rvv site/
+          else
+            echo "nl-rvv: not included in this build"
+          fi
           # PR #505's regional scenery data (BeamNG.Earth tools/build_regional_data.py): static, from this repo's
           # release "regional-data" (asset regional.tar), unpacked as site/regional (optional: without it the rest publishes)
           if gh release download regional-data -R "$GITHUB_REPOSITORY" -p regional.tar -D parts 2>/dev/null; then
