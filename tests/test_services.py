@@ -34,6 +34,15 @@ def fixture():
 
 
 class ServiceDataTest(unittest.TestCase):
+    def test_bidirectional_ramp_stored_toward_mainline_is_checked_from_exit(self):
+        data = fixture()
+        ramp = next(e for e in data['elements'] if e['type'] == 'way' and e['id'] == 20)
+        ramp['nodes'].reverse()
+        ramp['tags'] = dict(highway='trunk_link', oneway='no')
+        result = serviceindex.build(data)
+        self.assertEqual(result['audit'][0]['status'], 'with_services')
+        self.assertEqual(result['objects'][0]['exit']['services'][0]['id'], 'osm:n6')
+
     def test_audit_distinguishes_checked_empty_and_excluded(self):
         data = fixture()
         result = serviceindex.build(data)

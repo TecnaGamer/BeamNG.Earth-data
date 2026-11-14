@@ -167,6 +167,8 @@ def _import_pbf(path, db, work, fingerprint):
             if tags.get('highway') in ('motorway_link','trunk_link') and points:
                 start = points[-1] if index.exitsigns._direction(tags) == -1 else points[0]
                 db.execute('INSERT OR IGNORE INTO cores VALUES(?,?)',coverage.cell(*start))
+                if index.exitsigns._direction(tags) == 0:
+                    db.execute('INSERT OR IGNORE INTO cores VALUES(?,?)',coverage.cell(*points[-1]))
         count += 1
         if count%10000 == 0:
             db.commit()

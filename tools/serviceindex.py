@@ -177,12 +177,17 @@ def build(data, policy_path=POLICY, owner=None):
         if tags.get('highway') in ('motorway_link', 'trunk_link'): links.append((wid, refs, tags))
         if not allowed(tags): continue
         if controlled(tags): main.append((wid, refs, tags))
-    indexed = {r['ways'][0]['ramp_id']: r for r in exitsigns.index_records(main, links, coords, nodes)}
     incoming = set()
     for _, refs, tags in main:
         direction = exitsigns._direction(tags)
         if direction >= 0: incoming.update(refs[1:])
         if direction <= 0: incoming.update(refs[:-1])
+    # A two-way trunk ramp can be stored from the local road toward the freeway.
+    # Orient its exit record from the freeway, retaining two-way graph access.
+    links = [(rid, refs, dict(tags, oneway='-1'))
+             if exitsigns._direction(tags) == 0 and refs and refs[-1] in incoming and refs[0] not in incoming
+             else (rid, refs, tags) for rid, refs, tags in links]
+    indexed = {r['ways'][0]['ramp_id']: r for r in exitsigns.index_records(main, links, coords, nodes)}
     records, checks = [], []
     for rid, refs, tags in links:
         directed = refs[::-1] if exitsigns._direction(tags) == -1 else refs
@@ -200,6 +205,9 @@ def build(data, policy_path=POLICY, owner=None):
         if not allowed(tags):
             check['reason'] = 'restricted_ramp_access'
             continue
+        if exitsigns._direction(tags) == 0 and directed[0] in incoming and directed[-1] in incoming:
+            check.update(status='unresolved', reason='bidirectional_freeway_connector')
+            continue
         if directed[0] not in incoming:
             check['reason'] = 'not_an_outgoing_freeway_ramp'
             continue
@@ -215,10 +223,8 @@ def build(data, policy_path=POLICY, owner=None):
             continue
         rules = policy(state, policy_path)
         rid = extra['ramp_id']
-        refs, tags = ways[rid]
-        refs = refs[::-1] if exitsigns._direction(tags) == -1 else refs
         # Start on this outgoing ramp, and retain every metre of its cost.
-        start = refs[0]
+        start = directed[0]
         limit = max(rules['distance_m'].values())
         queue, distances, found = [(0., start)], {start: 0.}, {}
         previous = {}
