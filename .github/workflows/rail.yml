@@ -352,8 +352,92 @@ jobs:
           path: out
           retention-days: 3
 
+  tallbld:
+    # The tall-building index for the horizon ring (BeamNG.Earth tools/build_tall_index.py, read by server/bldhz.py):
+    # every Overture building at least 60 m tall (its height, its storeys or one of its parts) with all its parts, one
+    # blob a zoom-12 tile, in PMTiles archive parts. From the Overture release pinned here (tools/overture_stac_*.json.gz:
+    # its file list): the files' footers first (tail reads, cached by release), then only the row groups whose
+    # statistics may hold a tall building (~7.6k row groups, ~23 GB of ranges from Overture's S3, into sparse files
+    # under /mnt). A pinned copy in this repo, as osmyears' builder: this job holds the R2 secrets, so it runs no code
+    # fetched from elsewhere. The parts and the manifest as osmyears': each build's parts in a folder of their own
+    # (tallbld/<key>/, never overwritten), each checked against the manifest's size and SHA-256 first, the manifest on
+    # Pages pointing at them, after the parts. Optional: without it there are no buildings past the skyline.
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tools
+        run: pip install "duckdb==1.5.6" numpy
+      - name: The release
+        id: rel
+        run: |
+          S=$(ls tools/overture_stac_*.json.gz | sort | tail -1)
+          echo "stac=$S" >> "$GITHUB_OUTPUT"
+          echo "release=$(basename "$S" .json.gz | sed 's/^overture_stac_//')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: footers
+          key: tallbld-footers-${{ steps.rel.outputs.release }}
+      - name: Build
+        run: |
+          sudo mkdir -p /mnt/tallwork && sudo chown "$USER" /mnt/tallwork
+          df -h / /mnt
+          python tools/build_tall_index.py --stac "${{ steps.rel.outputs.stac }}" --footers footers --fetch-footers
+          python tools/build_tall_index.py --stac "${{ steps.rel.outputs.stac }}" --footers footers \
+            --work /mnt/tallwork --world --pages out/tallbld
+          rm -rf /mnt/tallwork
+      - name: The parts to the tile host, the manifest pointing at them
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (see the osmtags job)
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          D=out/tallbld
+          KEY=$(python -c "import json, re, sys; k = json.load(open('$D/manifest.json'))['key']; assert re.fullmatch(r'[0-9A-Za-z_.-]{4,80}', k); print(k)")
+          ls -l "$D" "$D/$KEY"
+          python - "$D/manifest.json" <<'PY'
+          import hashlib, json, os, sys
+          d = os.path.dirname(sys.argv[1])
+          m = json.load(open(sys.argv[1]))
+          assert m["parts"], "no parts"
+          for p in m["parts"]:
+              assert p["archive"].startswith(m["key"] + "/"), p["archive"]
+              b = open(os.path.join(d, p["archive"]), "rb").read()
+              assert len(b) == p["bytes"] and hashlib.sha256(b).hexdigest() == p["sha256"], p["archive"]
+              assert len(b) < 536870912, p["archive"]     # (Cloudflare's free plan caches files up to 512 MB)
+          print(len(m["parts"]), "parts checked")
+          PY
+          for f in "$D/$KEY"/tallbld*.pmtiles; do
+            for try in 1 2 3; do
+              aws s3 cp "$f" "s3://bnge-tiles/tallbld/$KEY/$(basename "$f")" --endpoint-url "$R2" --only-show-errors \
+                --content-type application/octet-stream --cache-control "public, max-age=31536000, immutable" && break
+              test "$try" -lt 3; sleep $((try * 20))
+            done
+          done
+          python - "$D/manifest.json" "https://tiles.tgforever.net/tallbld" <<'PY'
+          import json, sys
+          m = json.load(open(sys.argv[1]))
+          for p in m["parts"]:
+              p["archive"] = f"{sys.argv[2]}/{p['archive']}"
+          json.dump(m, open(sys.argv[1], "w"), separators=(",", ":"))
+          PY
+          rm -r "$D/$KEY"
+          mkdir -p pub && cp -r "$D" pub/
+          head -c 1200 pub/tallbld/manifest.json; echo
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tallbld
+          path: pub
+          retention-days: 3
+
   site:
-    needs: [rail, lanes, signs, osmtags, osmyears, osmcolours, stations]
+    needs: [rail, lanes, signs, osmtags, osmyears, osmcolours, stations, tallbld]
     # (the sign shards, the OSM road tags and the stations are optional: a failed signs / osmtags / stations job leaves
     # them out, the rail and lane data still publish; osmyears and osmcolours likewise)
     if: ${{ !cancelled() && needs.rail.result == 'success' && needs.lanes.result == 'success' }}
@@ -374,6 +458,7 @@ jobs:
           if [ -d parts/osmtags ]; then cp -r parts/osmtags/* site/; fi
           if [ -d parts/osmyears ]; then cp -r parts/osmyears/* site/; fi
           if [ -d parts/osmcolours ]; then cp -r parts/osmcolours/* site/; fi
+          if [ -d parts/tallbld ]; then cp -r parts/tallbld/* site/; fi
           if [ -d parts/stations ]; then cp -r parts/stations/* site/; fi
           # PR #505's regional scenery data (BeamNG.Earth tools/build_regional_data.py): static, from this repo's
           # release "regional-data" (asset regional.tar), unpacked as site/regional (optional: without it the rest publishes)
