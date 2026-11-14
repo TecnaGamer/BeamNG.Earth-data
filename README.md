@@ -122,6 +122,33 @@ part against its shard's record before upload, and an archive's index is written
 The server reads them when `BNGE_BNWT_URL` is `https://tiles.tgforever.net`. Data © OpenStreetMap contributors,
 Overture Maps Foundation.
 
+## nl-signal-context/: optional Dutch vehicle signal context
+
+The existing `rail` workflow also builds this optional dataset, independently
+of the rail/lane jobs. `tools/fetch_nl_signal_sources.py` downloads a pinned,
+SHA-256-verified Rijkswaterstaat WKD built-up-area GeoPackage and bounded
+OpenStreetMap Overpass exports (motor-road signal nodes and turn-lane ways).
+Raw sources stay in the build job. `tools/build_nl_signal_context.py` writes
+deterministic z14 gzip shards and a source/hash manifest; `tools/nl_context_ci.py`
+rechecks every artifact before the existing site/mirror jobs publish it.
+
+The derived database is ODbL 1.0, with OpenStreetMap contributors and
+Rijkswaterstaat/NDW attribution. It contains spatial context, not surveyed stop
+lines or sign photographs. BeamNG.Earth's optional native server planner reads
+only nearby tiles. An unpublished or failed dataset leaves existing signals
+available. No national context pack is added to the game download.
+
+Rebuild locally with Python 3.12, pyproj and shapely:
+
+```
+python tools/fetch_nl_signal_sources.py sources
+python tools/build_nl_signal_context.py sources/WKD_KOM_BORDEN.gpkg sources/turns.json sources/signals.json out/nl-signal-context
+python tools/nl_context_ci.py out/nl-signal-context
+```
+
+The application counterpart is BeamNG.Earth PR #1214. Merging the data workflow
+does not itself deploy a new client release; maintainers control publication.
+
 ## addons.json: the in-game Add-ons page's list (edited by hand)
 The add-ons BeamNG.Earth's Add-ons page offers and lets players install (server/addons.py, REGISTRY_URL; read through
 raw.githubusercontent.com, not the Pages site, so editing it needs no data build). Every edit reaches players within a

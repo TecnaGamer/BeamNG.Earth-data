@@ -252,8 +252,35 @@ jobs:
           path: out
           retention-days: 3
 
+  nl-signal-context:
+    # Reproducible public inputs; only small derived tiles enter the site.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Producer dependencies
+        run: pip install pyproj shapely
+      - name: Public context sources and derived shards
+        run: |
+          python tools/test_nl_context_ci.py
+          python tools/fetch_nl_signal_sources.py sources
+          python tools/build_nl_signal_context.py sources/WKD_KOM_BORDEN.gpkg sources/turns.json sources/signals.json out/nl-signal-context
+          python tools/nl_context_ci.py out/nl-signal-context
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nl-signal-context
+          path: out
+          retention-days: 3
+
   site:
-    needs: [rail, lanes, signs, osmtags, stations, nl-rvv]
+    needs: [rail, lanes, signs, osmtags, stations, nl-rvv, nl-signal-context]
     # (the sign shards, the OSM road tags and the stations are optional: a failed signs / osmtags / stations job leaves
     # them out, the rail and lane data still publish)
     if: ${{ !cancelled() && needs.rail.result == 'success' && needs.lanes.result == 'success' }}
@@ -279,6 +306,11 @@ jobs:
             cp -r parts/nl-rvv/nl-rvv site/
           else
             echo "nl-rvv: not included in this build"
+          fi
+          if [ -d parts/nl-signal-context/nl-signal-context ] && python3 tools/nl_context_ci.py parts/nl-signal-context/nl-signal-context; then
+            cp -r parts/nl-signal-context/nl-signal-context site/
+          else
+            echo "nl-signal-context: not included in this build"
           fi
           # PR #505's regional scenery data (BeamNG.Earth tools/build_regional_data.py): static, from this repo's
           # release "regional-data" (asset regional.tar), unpacked as site/regional (optional: without it the rest publishes)
