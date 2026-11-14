@@ -53,6 +53,39 @@ Build: `python tools/build_route_relation_index.py PLANET.osm.pbf out/routes`
 
 **License:** © OpenStreetMap contributors, [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1-0/).
 
+## services/: US service-sign coverage with fictional business names (weekly)
+
+The optional `services` job reads a dated Geofabrik United States extract into
+SQLite/RTree, then checks outgoing freeway ramps against mapped service categories
+and driving access. Half-degree cells include a routing halo across state/cell
+boundaries. Display names are deterministic fictional names; real business names,
+brands and operators are not published. The boards are inferred scenery, not a
+survey of real signs or advertising participation.
+
+`services/manifest.json` identifies the source URL/SHA-256, policy/code snapshot,
+cell checksums and `audit.json`. Cells account for every imported ramp as checked
+with services, checked without services, excluded (with a reason), or unresolved.
+The audit aggregates all 50 states/DC, categories and statuses. A zero count does
+not assert completeness of a state's real sign inventory.
+
+The public manifest is replaced only after every cell and audit validate. Failed,
+empty or truncated builds retain the previous publication; the site job reuses
+the last good artifact if this optional job fails. Pages and the existing R2
+mirror serve it; the application downloads nearby cells into its runtime cache.
+The national source is about 12 GB and indexing uses additional disk. The builder
+stops below 15 GiB free; runners must have sufficient disk/time for the full job.
+Set the repository variable `SERVICE_SIGNS_RUNNER` to a suitable runner label if
+the standard hosted runner is too small.
+
+Build: `python tools/build_us_service_signs.py --output out/services`.
+Audit: `python tools/build_us_service_signs.py --check --output out/services`.
+Tests: `python -m unittest discover -s tests -p test_services.py -v` after installing
+`tools/service_signs.requirements.txt`. No game/native module is required. Build
+and resume files remain under `build/`; generated databases are never committed.
+
+**License:** ? OpenStreetMap contributors, ODbL 1.0. The fictional names do not
+change the underlying geographic data's attribution.
+
 ## stations/: OpenStreetMap's fuel and charging stations (weekly)
 
 `stations/<x>/<y>.json.gz` per zoom-7 tile: every `amenity=fuel` and `amenity=charging_station` (a node, or a way's
@@ -127,3 +160,4 @@ few hours, with no release in between: treat a change here like a release. Only 
 whose files were checked first. A file that can't be read, or whose entries are all invalid, leaves players on the list
 bundled with their version; an empty `addons` list takes every add-on off. The format is in BeamNG.Earth's
 docs/ADDONS.md.
+
