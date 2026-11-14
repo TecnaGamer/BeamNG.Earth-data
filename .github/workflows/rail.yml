@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: read
+  actions: read   # (deploy: an optional job that failed keeps its last good artifact)
   pages: write
   id-token: write
 
@@ -102,6 +103,11 @@ jobs:
                    server/milemarkers.py server/routeshields.py server/signshards.py; do
             curl -sfL -o "$(basename "$f")" "$B/$f"
           done
+          # (the sign modules' deterministic maths, dmath / dnp, call BeamNG.Earth's native module; this one CI build
+          # makes the one file every player reads, so math and numpy stand in for them here: without these the job
+          # failed from 2026-11-13 on, BeamNG.Earth #1169)
+          printf 'import math\n\n\ndef __getattr__(n):\n    return getattr(math, n)\n' > dmath.py
+          printf 'import numpy as np\n\n\ndef __getattr__(n):\n    return getattr(np, n) if hasattr(np, n) else getattr(np.linalg, n)\n' > dnp.py
       - name: Build
         run: |
           python build_sign_tags.py "${{ needs.planet.outputs.url }}" out/signs
@@ -452,6 +458,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p site
+          # an optional job that failed this time: its last good artifact from an earlier run instead (a deploy
+          # replaces the whole site, so a failed signs job took the sign shards off Pages from 2026-11-13 on)
+          for n in signs osmtags osmyears osmcolours tallbld stations; do
+            [ -d "parts/$n" ] && continue
+            id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$n&per_page=20" -q '[.artifacts[] | select(.expired | not)][0].workflow_run.id // empty' || true)
+            if [ -n "$id" ] && gh run download "$id" -R "$GITHUB_REPOSITORY" -n "$n" -D "parts/$n"; then
+              echo "$n: this run's job failed; the artifact of run $id instead"; fi
+          done
           cp -r parts/rail/* site/
           cp -r parts/lanes/* site/
           if [ -d parts/signs ]; then cp -r parts/signs/* site/; fi
