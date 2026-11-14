@@ -118,6 +118,29 @@ jobs:
           path: out
           retention-days: 3
 
+  routes:
+    # US road-route identities and way memberships only (no geometry or sign positions), for the US route shields:
+    # tools/build_route_relation_index.py (data PR #4, wyo-backroads, ported). Optional like the signs.
+    needs: planet
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tools
+        run: pip install "osmium==4.3.2"
+      - name: Builder tests
+        run: python -m unittest discover -s tests -v
+      - name: Build
+        run: python tools/build_route_relation_index.py "${{ needs.planet.outputs.url }}" out/routes
+      - uses: actions/upload-artifact@v4
+        with:
+          name: routes
+          path: out
+          retention-days: 3
+
   osmtags:
     # OpenStreetMap's road tags (lanes, width, speed limit, sidewalk, surface ...) of OSM US's Layercake highways file,
     # one blob per zoom-12 tile in a PMTiles archive cut into parts of <= 400 MB (BeamNG.Earth
@@ -443,7 +466,7 @@ jobs:
           retention-days: 3
 
   site:
-    needs: [rail, lanes, signs, osmtags, osmyears, osmcolours, stations, tallbld]
+    needs: [rail, lanes, signs, osmtags, osmyears, osmcolours, stations, tallbld, routes]
     # (the sign shards, the OSM road tags and the stations are optional: a failed signs / osmtags / stations job leaves
     # them out, the rail and lane data still publish; osmyears and osmcolours likewise)
     if: ${{ !cancelled() && needs.rail.result == 'success' && needs.lanes.result == 'success' }}
@@ -460,7 +483,7 @@ jobs:
           mkdir -p site
           # an optional job that failed this time: its last good artifact from an earlier run instead (a deploy
           # replaces the whole site, so a failed signs job took the sign shards off Pages from 2026-11-13 on)
-          for n in signs osmtags osmyears osmcolours tallbld stations; do
+          for n in signs osmtags osmyears osmcolours tallbld stations routes; do
             [ -d "parts/$n" ] && continue
             id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$n&per_page=20" -q '[.artifacts[] | select(.expired | not)][0].workflow_run.id // empty' || true)
             if [ -n "$id" ] && gh run download "$id" -R "$GITHUB_REPOSITORY" -n "$n" -D "parts/$n"; then
@@ -474,6 +497,7 @@ jobs:
           if [ -d parts/osmcolours ]; then cp -r parts/osmcolours/* site/; fi
           if [ -d parts/tallbld ]; then cp -r parts/tallbld/* site/; fi
           if [ -d parts/stations ]; then cp -r parts/stations/* site/; fi
+          if [ -d parts/routes ]; then cp -r parts/routes/* site/; fi
           # PR #505's regional scenery data (BeamNG.Earth tools/build_regional_data.py): static, from this repo's
           # release "regional-data" (asset regional.tar), unpacked as site/regional (optional: without it the rest publishes)
           if gh release download regional-data -R "$GITHUB_REPOSITORY" -p regional.tar -D parts 2>/dev/null; then
@@ -504,7 +528,7 @@ jobs:
             rm -f parts/de-roads-16-states.tar; echo "deroads: not published this run"; fi
           du -sh site; du -sh site/* | sort -h | tail -8
           cp README.md site/
-          printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>, lane-level road tags: <a href="lanes/manifest.json">lanes/manifest.json</a>, highway sign sources: <a href="signs/manifest.json">signs/manifest.json</a>, fuel and charging stations: <a href="stations/manifest.json">stations/manifest.json</a>, level crossings (US): <a href="fra/manifest.json">fra/manifest.json</a>, measured German roofs: <a href="lod2/manifest.json">lod2/manifest.json</a> (sources and licences: <a href="lod2/ATTRIBUTION.md">lod2/ATTRIBUTION.md</a>), surveyed German roads: <a href="deroads/ATTRIBUTION.md">deroads/ATTRIBUTION.md</a>, measured roofs of Switzerland, Estonia and Vienna: <a href="lod2-ch/ATTRIBUTION.md">lod2-ch</a>, <a href="lod2-ee/ATTRIBUTION.md">lod2-ee</a>, <a href="lod2-wien/ATTRIBUTION.md">lod2-wien</a>, New York building massing: <a href="nycmassing/v1/manifest.json">nycmassing/v1/manifest.json</a> (<a href="nycmassing/ATTRIBUTION.md">nycmassing/ATTRIBUTION.md</a>). Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
+          printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>, lane-level road tags: <a href="lanes/manifest.json">lanes/manifest.json</a>, highway sign sources: <a href="signs/manifest.json">signs/manifest.json</a>, US road-route membership: <a href="routes/manifest.json">routes/manifest.json</a>, fuel and charging stations: <a href="stations/manifest.json">stations/manifest.json</a>, level crossings (US): <a href="fra/manifest.json">fra/manifest.json</a>, measured German roofs: <a href="lod2/manifest.json">lod2/manifest.json</a> (sources and licences: <a href="lod2/ATTRIBUTION.md">lod2/ATTRIBUTION.md</a>), surveyed German roads: <a href="deroads/ATTRIBUTION.md">deroads/ATTRIBUTION.md</a>, measured roofs of Switzerland, Estonia and Vienna: <a href="lod2-ch/ATTRIBUTION.md">lod2-ch</a>, <a href="lod2-ee/ATTRIBUTION.md">lod2-ee</a>, <a href="lod2-wien/ATTRIBUTION.md">lod2-wien</a>, New York building massing: <a href="nycmassing/v1/manifest.json">nycmassing/v1/manifest.json</a> (<a href="nycmassing/ATTRIBUTION.md">nycmassing/ATTRIBUTION.md</a>). Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
           ls site
       - name: The datasets' files to the tile host, each manifest naming that copy ("data")
         # (players read ~1.15 TB a month of these from Pages, whose soft limit is 100 GB: BeamNG.Earth's server reads a
