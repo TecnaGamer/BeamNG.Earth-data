@@ -35,8 +35,9 @@ last KEEP_BUILDS folders); the manifest also has "facade", "roof" (rows with eac
 
 Blob (OBC1, earthfast buildcolours.rs), LEB128 varints: "OBC1", uv n, n x uv key deltas (ascending, one row a key: 2 x
 the OSM id, + 1 for a relation), n flag bytes (FACADE 1: the row has a facade colour, ROOF 2: a roof colour; no other
-bit), uv m, the palette: m x 3 bytes r, g, b (the tile's colours, ascending as 0xRRGGBB, each once), then for every row
-with FACADE in key order uv its palette index, then likewise for ROOF.
+bit, never 0: every row has a colour), uv m, the palette: m x 3 bytes r, g, b (the tile's colours, ascending as
+0xRRGGBB, each once), then for every row with FACADE in key order uv its palette index, then likewise for ROOF. The
+decoder's bounds (buildcolours.rs): 2 M rows a tile, 16 MiB inflated.
 
 Data (c) OpenStreetMap contributors, ODbL 1.0.
 """
@@ -164,6 +165,8 @@ def encode_tile(keys, facade, roof):
     fac = np.asarray(facade, np.int64)
     rf = np.asarray(roof, np.int64)
     flags = ((fac >= 0) * FACADE + (rf >= 0) * ROOF).astype(np.uint8)
+    if not flags.all():
+        raise ValueError("a row with neither colour (the decoder refuses the tile)")
     pal = np.unique(np.concatenate([fac[fac >= 0], rf[rf >= 0]]))
     rgb = np.stack([(pal >> 16) & 255, (pal >> 8) & 255, pal & 255], 1).astype(np.uint8)
     d = np.diff(keys, prepend=np.uint64(0)) if len(keys) else keys
