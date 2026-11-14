@@ -254,6 +254,76 @@ jobs:
           path: pub
           retention-days: 3
 
+  osmcolours:
+    # OpenStreetMap's mapped colours of buildings and building parts (building:colour, roof:colour) as RGB, from the
+    # newest planet (streamed three times by curl: nothing stored), one blob per zoom-12 tile in PMTiles archive parts
+    # (BeamNG.Earth tools/build_osm_building_colours.py, read by server/osmcolours.py: the colours Overture drops,
+    # filled only where its own are empty). Pinned copies in this repo (with build_osm_building_years.py and
+    # build_osm_tag_shards.py, which write its parts): this job holds the R2 secrets, so it runs no code fetched from
+    # elsewhere (the planet is data). The parts and the manifest as osmyears': each build's parts in a folder of their
+    # own (osmcolours/<key>/, never overwritten), each checked against the manifest's size and SHA-256 first, the
+    # manifest on Pages pointing at them, after the parts. Optional: without it the buildings keep Overture's colours.
+    needs: planet
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tools
+        run: pip install "osmium==4.3.2" numpy
+      - name: Build
+        run: |
+          python tools/build_osm_building_colours.py "${{ needs.planet.outputs.url }}" out/osmcolours
+      - name: The parts to the tile host, the manifest pointing at them
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (see the osmtags job)
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          D=out/osmcolours
+          KEY=$(python -c "import json, re, sys; k = json.load(open('$D/manifest.json'))['key']; assert re.fullmatch(r'[0-9A-Za-z_.-]{4,80}', k); print(k)")
+          ls -l "$D" "$D/$KEY"
+          python - "$D/manifest.json" <<'PY'
+          import hashlib, json, os, sys
+          d = os.path.dirname(sys.argv[1])
+          m = json.load(open(sys.argv[1]))
+          assert m["parts"], "no parts"
+          for p in m["parts"]:
+              assert p["archive"].startswith(m["key"] + "/"), p["archive"]
+              b = open(os.path.join(d, p["archive"]), "rb").read()
+              assert len(b) == p["bytes"] and hashlib.sha256(b).hexdigest() == p["sha256"], p["archive"]
+              assert len(b) < 536870912, p["archive"]     # (Cloudflare's free plan caches files up to 512 MB)
+          print(len(m["parts"]), "parts checked,", m["rows"], "rows,", m["facade"], "facade,", m["roof"], "roof colours,",
+                m["unread"], "values not read")
+          PY
+          for f in "$D/$KEY"/osmcolours*.pmtiles; do
+            for try in 1 2 3; do
+              aws s3 cp "$f" "s3://bnge-tiles/osmcolours/$KEY/$(basename "$f")" --endpoint-url "$R2" --only-show-errors \
+                --content-type application/octet-stream --cache-control "public, max-age=31536000, immutable" && break
+              test "$try" -lt 3; sleep $((try * 20))
+            done
+          done
+          python - "$D/manifest.json" "https://tiles.tgforever.net/osmcolours" <<'PY'
+          import json, sys
+          m = json.load(open(sys.argv[1]))
+          for p in m["parts"]:
+              p["archive"] = f"{sys.argv[2]}/{p['archive']}"
+          json.dump(m, open(sys.argv[1], "w"), separators=(",", ":"))
+          PY
+          rm -r "$D/$KEY"
+          mkdir -p pub && cp -r "$D" pub/
+          head -c 1200 pub/osmcolours/manifest.json; echo
+      - uses: actions/upload-artifact@v4
+        with:
+          name: osmcolours
+          path: pub
+          retention-days: 3
+
   stations:
     # OpenStreetMap's fuel and charging stations with their capacity, and the charge points (stations/, read by
     # BeamNG.Earth's server/railtags.py StationTags: the station finder's map everywhere, EV chargers' real counts and
@@ -283,9 +353,9 @@ jobs:
           retention-days: 3
 
   site:
-    needs: [rail, lanes, signs, osmtags, osmyears, stations]
+    needs: [rail, lanes, signs, osmtags, osmyears, osmcolours, stations]
     # (the sign shards, the OSM road tags and the stations are optional: a failed signs / osmtags / stations job leaves
-    # them out, the rail and lane data still publish; osmyears likewise)
+    # them out, the rail and lane data still publish; osmyears and osmcolours likewise)
     if: ${{ !cancelled() && needs.rail.result == 'success' && needs.lanes.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
@@ -303,6 +373,7 @@ jobs:
           if [ -d parts/signs ]; then cp -r parts/signs/* site/; fi
           if [ -d parts/osmtags ]; then cp -r parts/osmtags/* site/; fi
           if [ -d parts/osmyears ]; then cp -r parts/osmyears/* site/; fi
+          if [ -d parts/osmcolours ]; then cp -r parts/osmcolours/* site/; fi
           if [ -d parts/stations ]; then cp -r parts/stations/* site/; fi
           # PR #505's regional scenery data (BeamNG.Earth tools/build_regional_data.py): static, from this repo's
           # release "regional-data" (asset regional.tar), unpacked as site/regional (optional: without it the rest publishes)
