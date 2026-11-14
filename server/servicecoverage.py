@@ -57,8 +57,9 @@ class Source:
                 if self.remote.manifest is None:
                     return None
                 self.manifest = self.remote.manifest
-                selected = {k: self.manifest['cells'].get(k, {}).get('sha256') for k in sorted(self.wanted)}
-                return hashlib.sha256(json.dumps([self.manifest['built'], selected], sort_keys=True).encode()).hexdigest()
+                # Published builds are transactional. A common build identity keeps
+                # the pose handler and all road workers on the same cache key.
+                return self.remote.built
             path = self.directory/'manifest.json'
             try:
                 stat = path.stat()
