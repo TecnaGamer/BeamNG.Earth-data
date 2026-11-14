@@ -394,7 +394,7 @@ jobs:
           python tools/build_tall_index.py --stac "${{ steps.rel.outputs.stac }}" --footers footers --fetch-footers
           python tools/build_tall_index.py --stac "${{ steps.rel.outputs.stac }}" --footers footers \
             --work /mnt/tallwork --world --pages out/tallbld
-          rm -rf /mnt/tallwork
+          sudo rm -rf /mnt/tallwork   # (/mnt is root's: the folder itself goes with sudo)
       - name: The parts to the tile host, the manifest pointing at them
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
