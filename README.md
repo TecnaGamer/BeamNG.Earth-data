@@ -12,6 +12,8 @@ the manifest's `"parts"` list.
 
 ## nl-rvv/: Dutch roadside sign attributes (optional weekly build)
 
+Maintainers: [Dutch dataset publication, checks and rollback](NL_DATA_OPERATIONS.md).
+
 `nl-rvv/<x>/<y>.json.gz` per zoom-12 tile contains official NDW current-state
 roadside sign attributes: source identifiers, position, viewing direction,
 supported RVV meaning and complete supported text qualifiers. There are no sign
