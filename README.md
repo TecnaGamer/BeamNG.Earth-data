@@ -10,6 +10,30 @@ dataset's `manifest.json` on Pages names that copy in its `"data"` field: BeamNG
 falls back to Pages. The OSM road tag archive (`osmtags/`) is on the tile host only, in parts of at most 400 MB that
 the manifest's `"parts"` list.
 
+## nl-rvv/: Dutch roadside sign attributes (optional weekly build)
+
+Maintainers: [Dutch dataset publication, checks and rollback](NL_DATA_OPERATIONS.md).
+
+`nl-rvv/<x>/<y>.json.gz` per zoom-12 tile contains official NDW current-state
+roadside sign attributes: source identifiers, position, viewing direction,
+supported RVV meaning and complete supported text qualifiers. There are no sign
+photographs, vendor artwork, national CSV exports or a private store in this
+dataset. The application renders shared meshes with its own face atlas.
+
+The optional `nl-rvv` job in the existing `data` workflow uses
+`tools/build_nl_rvv.py` and `server/nlrvvdata.py` from BeamNG.Earth `dev`. It
+requires the producer from application PR #1214 to have merged there. The build
+job has read-only repository permission; this repository's own
+`tools/nl_roadside_ci.py` checks the artifact both before upload and again before
+it is merged into the existing site. The existing tile-host mirror discovers
+the new dataset by its manifest. No separate Pages deployment replaces the
+other datasets. If this optional dataset fails, rail and lane data still publish.
+
+**Licence:** NDW attribute data, CC0-1.0; the produced manifest retains the source
+export URL, source SHA-256 and NDW terms link. This licence does not cover sign
+photographs or the application's artwork. No deployment has been performed by
+the application PR.
+
 ## rail/: OpenStreetMap's railways (weekly)
 
 `rail/<x>/<y>.json.gz` per zoom-7 tile with railways: OpenStreetMap's railway tags by way id (railway, usage,
@@ -119,6 +143,33 @@ range read for a block of cells): the archives `base` (water, land use, infrastr
 part against its shard's record before upload, and an archive's index is written last, once all of its shards are up.
 The server reads them when `BNGE_BNWT_URL` is `https://tiles.tgforever.net`. Data © OpenStreetMap contributors,
 Overture Maps Foundation.
+
+## nl-signal-context/: optional Dutch vehicle signal context
+
+The existing `rail` workflow also builds this optional dataset, independently
+of the rail/lane jobs. `tools/fetch_nl_signal_sources.py` downloads a pinned,
+SHA-256-verified Rijkswaterstaat WKD built-up-area GeoPackage and bounded
+OpenStreetMap Overpass exports (motor-road signal nodes and turn-lane ways).
+Raw sources stay in the build job. `tools/build_nl_signal_context.py` writes
+deterministic z14 gzip shards and a source/hash manifest; `tools/nl_context_ci.py`
+rechecks every artifact before the existing site/mirror jobs publish it.
+
+The derived database is ODbL 1.0, with OpenStreetMap contributors and
+Rijkswaterstaat/NDW attribution. It contains spatial context, not surveyed stop
+lines or sign photographs. BeamNG.Earth's optional native server planner reads
+only nearby tiles. An unpublished or failed dataset leaves existing signals
+available. No national context pack is added to the game download.
+
+Rebuild locally with Python 3.12, pyproj and shapely:
+
+```
+python tools/fetch_nl_signal_sources.py sources
+python tools/build_nl_signal_context.py sources/WKD_KOM_BORDEN.gpkg sources/turns.json sources/signals.json out/nl-signal-context
+python tools/nl_context_ci.py out/nl-signal-context
+```
+
+The application counterpart is BeamNG.Earth PR #1214. Merging the data workflow
+does not itself deploy a new client release; maintainers control publication.
 
 ## addons.json: the in-game Add-ons page's list (edited by hand)
 The add-ons BeamNG.Earth's Add-ons page offers and lets players install (server/addons.py, REGISTRY_URL; read through
