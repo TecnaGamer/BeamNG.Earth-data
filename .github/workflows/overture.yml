@@ -65,6 +65,7 @@ jobs:
       served_listed: ${{ steps.d.outputs.served_listed }}
       published_at: ${{ steps.d.outputs.published_at }}
       codes: ${{ steps.d.outputs.codes }}
+      schemas: ${{ steps.d.outputs.schemas }}
       app_tag: ${{ steps.refs.outputs.app_tag }}
       app_sha: ${{ steps.refs.outputs.app_sha }}
       dev_sha: ${{ steps.refs.outputs.dev_sha }}
@@ -87,6 +88,18 @@ jobs:
           [[ "$SHA" =~ ^[0-9a-f]{40}$ && "$DEV" =~ ^[0-9a-f]{40}$ ]]
           { echo "app_tag=$REF"; echo "app_sha=$SHA"; echo "dev_sha=$DEV"; } >> "$GITHUB_OUTPUT"
           echo "BeamNG.Earth $REF = $SHA; dev = $DEV" | tee -a "$GITHUB_STEP_SUMMARY"
+          # the latest published release's own RELEASE: never a release older than it (an older app_ref)
+          LATEST=$(gh api "repos/$CODE_REPO/releases/latest" --jq .tag_name)
+          [[ "$LATEST" =~ ^v[0-9][0-9A-Za-z.+-]{0,63}$ ]]
+          LSHA=$(gh api "repos/$CODE_REPO/commits/$LATEST" --jq .sha)
+          [[ "$LSHA" =~ ^[0-9a-f]{40}$ ]]
+          for f in server/overturepick.py server/overture.py; do
+            code=$(curl -sS -o floor.py -w '%{http_code}' "https://raw.githubusercontent.com/$CODE_REPO/$LSHA/$f")
+            [ "$code" = 200 ] && grep -q '^RELEASE = "' floor.py && break
+            [ "$code" = 200 ] || [ "$code" = 404 ] || { echo "::error::$LATEST's $f: HTTP $code"; exit 1; }
+            rm -f floor.py
+          done
+          [ -f floor.py ] || { echo "::error::no RELEASE line in $LATEST"; exit 1; }
           for w in "app $SHA" "dev $DEV"; do
             set -- $w
             code=$(curl -sS -o "pick-$1.py" -w '%{http_code}' "https://raw.githubusercontent.com/$CODE_REPO/$2/server/overturepick.py")
@@ -106,7 +119,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 tools/overture_ci.py detect --cdn cdn.json --app-pick pick-app.py --dev-pick pick-dev.py \
-            --app-sha "$APP_SHA" --dev-sha "$DEV_SHA" --candidate candidate.json --want "$WANT" 2> detect.log > out.txt \
+            --app-sha "$APP_SHA" --dev-sha "$DEV_SHA" --candidate candidate.json --want "$WANT" --floor-pick floor.py \
+            2> detect.log > out.txt \
             || rc=$?
           cat detect.log out.txt | tee -a "$GITHUB_STEP_SUMMARY"
           [ "${rc:-0}" = 0 ] || exit "$rc"
@@ -221,7 +235,7 @@ jobs:
           # (compared with the newest STAC in tools/ and the app's own places snapshot, when there are)
           PREV=$( (ls data/tools/overture_stac_*.json.gz 2>/dev/null || true) | sort -V | tail -1)
           LIKE=$( (ls code/server/data/places_*.json.gz 2>/dev/null || true) | sort -V | tail -1)
-          python3 data/tools/overture_ci.py check-stac "products/overture_stac_$REL.json.gz" --release "$REL" \
+          python3 data/tools/overture_ci.py check-stac "products/overture_stac_$REL.json.gz" --release "$REL" --upstream \
             ${PREV:+--like "$PREV"} | tee -a "$GITHUB_STEP_SUMMARY"
           python3 data/tools/overture_ci.py check-places "products/places_$REL.json.gz" --release "$REL" \
             ${LIKE:+--like "$LIKE"} | tee -a "$GITHUB_STEP_SUMMARY"
@@ -270,7 +284,20 @@ jobs:
             sleep $((i * 10)); git pull -q --rebase origin main
           done
           $pushed
-      - name: "The candidate for the mini PC's decision builder (candidates branch)"
+      - name: "The builds: rail.yml (its tallbld job takes the newest STAC) and bnwt.yml"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REL: ${{ needs.detect.outputs.release }}
+          APP_SHA: ${{ needs.detect.outputs.app_sha }}
+        run: |
+          set -euo pipefail
+          got=$(curl -sS https://tecnagamer.github.io/BeamNG.Earth-data/tallbld/manifest.json \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin).get("release", ""))' || true)
+          if [ "$got" = "$REL" ]; then echo "tallbld names $REL already"; else gh workflow run rail.yml --ref main; fi
+          gh workflow run bnwt.yml --ref main -f release="$REL" -f code_ref="$APP_SHA"
+
+      - name: "The candidate for the mini PC's decision builder (candidates branch; last: a failed step before it
+          leaves no candidate, and the next daily run publishes again)"
         env:
           REL: ${{ needs.detect.outputs.release }}
           SERVED: ${{ needs.detect.outputs.served }}
@@ -293,17 +320,6 @@ jobs:
           git -C "$C" add overture.json
           git -C "$C" commit -q -m "Candidate: Overture $REL for BeamNG.Earth $APP_TAG ($APP_SHA)"
           git -C "$C" push -q origin HEAD:refs/heads/candidates
-      - name: "The builds: rail.yml (its tallbld job takes the newest STAC) and bnwt.yml"
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REL: ${{ needs.detect.outputs.release }}
-          APP_SHA: ${{ needs.detect.outputs.app_sha }}
-        run: |
-          set -euo pipefail
-          got=$(curl -sS https://tecnagamer.github.io/BeamNG.Earth-data/tallbld/manifest.json \
-            | python3 -c 'import json, sys; print(json.load(sys.stdin).get("release", ""))' || true)
-          if [ "$got" = "$REL" ]; then echo "tallbld names $REL already"; else gh workflow run rail.yml --ref main; fi
-          gh workflow run bnwt.yml --ref main -f release="$REL" -f code_ref="$APP_SHA"
 
   gate:
     # (no secrets, read-only token: the app's own code computes the decision archives' version key)
@@ -366,6 +382,7 @@ jobs:
         env:
           REL: ${{ needs.detect.outputs.release }}
           SERVED: ${{ needs.detect.outputs.served }}
+          SCHEMAS: ${{ needs.detect.outputs.schemas }}
           AT: ${{ needs.detect.outputs.published_at }}
           SCHEMA_OK: ${{ needs.gate.outputs.schema_ok }}
           VKEY: ${{ needs.gate.outputs.vkey }}
@@ -376,7 +393,7 @@ jobs:
           set -euo pipefail
           python3 tools/overture_ci.py gate --release "$REL" --served "$SERVED" --vkey "$VKEY" \
             --dec-format "$DEC_FORMAT" --bnwt-format "$BNWT_FORMAT" --bnwt-names "$BNWT_NAMES" \
-            --schema-ok "$SCHEMA_OK" --published-at "$AT" 2> gate.md > out.txt || rc=$?
+            --schema-ok "$SCHEMA_OK" --schemas "$SCHEMAS" --published-at "$AT" 2> gate.md > out.txt || rc=$?
           cat gate.md out.txt | tee -a "$GITHUB_STEP_SUMMARY"
           [ "${rc:-0}" = 0 ] || exit "$rc"
           cat out.txt >> "$GITHUB_OUTPUT"
@@ -399,6 +416,7 @@ jobs:
         env:
           REL: ${{ needs.detect.outputs.release }}
           SERVED: ${{ needs.detect.outputs.served }}
+          SCHEMAS: ${{ needs.detect.outputs.schemas }}
           SCHEMA_OK: ${{ needs.gate.outputs.schema_ok }}
           VKEY: ${{ needs.gate.outputs.vkey }}
           DEC_FORMAT: ${{ needs.gate.outputs.dec_format }}
@@ -408,7 +426,7 @@ jobs:
           set -euo pipefail
           python3 tools/overture_ci.py gate --release "$REL" --served "$SERVED" --vkey "$VKEY" \
             --dec-format "$DEC_FORMAT" --bnwt-format "$BNWT_FORMAT" --bnwt-names "$BNWT_NAMES" \
-            --schema-ok "$SCHEMA_OK" 2> gate.md > out.txt || rc=$?
+            --schema-ok "$SCHEMA_OK" --schemas "$SCHEMAS" 2> gate.md > out.txt || rc=$?
           cat gate.md out.txt
           [ "${rc:-0}" = 0 ] || exit "$rc"
           grep -qx 'ready=true' out.txt || { echo "::warning::not ready on the second check: nothing flipped"; exit 0; }
@@ -417,7 +435,8 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           for i in 1 2 3; do
             git fetch -q origin main && git reset -q --hard origin/main
-            python3 "$RUNNER_TEMP/overture_ci.py" flip-cdn cdn.json --release "$REL" | tee -a "$GITHUB_STEP_SUMMARY"
+            python3 "$RUNNER_TEMP/overture_ci.py" flip-cdn cdn.json --release "$REL" --expect-served "$SERVED" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
             if git diff --quiet -- cdn.json; then echo "cdn.json names $REL already"; exit 0; fi
             git commit -q -m "cdn.json: Overture $REL for every player (overture workflow, run $GITHUB_RUN_ID: STAC, corpus, tall index, decision archives $VKEY)" -- cdn.json
             if git push -q origin HEAD:main; then exit 0; fi
@@ -448,14 +467,14 @@ jobs:
           [[ "$PENDING" =~ ^[a-z\ ]*$ ]] || PENDING="(unreadable)"
           [[ "$AT" =~ ^[0-9T:Z-]*$ ]] || AT=""
           RUN="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          TITLE="Overture update $REL: needs attention"      # (one issue per release, whatever the cause)
           if [ "$FAILED" = true ]; then
-            TITLE="Overture update $REL: a step failed"
             BODY="The overture workflow stopped: $RUN. Nothing was flipped; cdn.json is unchanged. The next daily run tries again; close this issue once it is fixed."
           else
-            TITLE="Overture update $REL: the flip gate is waiting for more than 10 days"
             BODY="The candidate for Overture $REL was published $AT and the flip gate still waits for: $PENDING ($RUN). tallbld: rail.yml's tallbld job; decisions: the mini PC's bnge-overture-candidate timer (its done marker, journalctl --user -u bnge-overture-candidate); bnwt: bnwt.yml."
           fi
-          if gh issue list -R "$GITHUB_REPOSITORY" --state open --limit 200 --json title --jq '.[].title' | grep -Fxq -- "$TITLE"; then
+          if gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"$TITLE\" in:title" --limit 1000 \
+              --json title --jq '.[].title' | grep -Fxq -- "$TITLE"; then
             echo "an open issue says so already: $TITLE"
             exit 0
           fi

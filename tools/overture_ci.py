@@ -64,6 +64,7 @@ UA = "BeamNG.Earth-data overture workflow"
 MAX_DROP_PCT = 3.0
 MAX_GROW_PCT = 10.0
 SLACK = 25
+BNWT_ARCHIVES = {"base", "transportation", "buildings", "places"}    # (BeamNG.Earth bnwt.ARCHIVES: all of them)
 
 
 def valid(r):
@@ -142,6 +143,16 @@ def read_switch(path):
     return doc, body
 
 
+def pick_schemas(path):
+    """SUPPORTED_SCHEMAS of a tree's server/overturepick.py, read as text."""
+    with open(path, encoding="utf-8") as f:
+        m = re.search(r"^SUPPORTED_SCHEMAS = \(([^)]*)\)", f.read(1 << 20), re.M)
+    got = re.findall(r'"(\d+\.\d+\.\d+)"', m[1]) if m else []
+    if not got:
+        raise SystemExit(f"{path}: no SUPPORTED_SCHEMAS = (\"x.y.z\", ...) line")
+    return got
+
+
 def served_release(doc, app_release):
     """(release players are served, where from): cdn.json's overture release, else the app's own."""
     on = doc.get("overture")
@@ -176,10 +187,12 @@ def read_candidate(path):
     return doc if isinstance(doc, dict) and len(body) <= 65536 else None
 
 
-def detect(cdn_path, app_pick, dev_pick, app_sha, dev_sha, candidate=None, want="", stac=STAC, listing=None):
-    """The detect step's outputs (a dict)."""
+def detect(cdn_path, app_pick, dev_pick, app_sha, dev_sha, candidate=None, want="", stac=STAC, listing=None,
+           floor_pick=None):
+    """The detect step's outputs (a dict). floor_pick: the latest published release's overturepick.py or overture.py
+    (its RELEASE line): never a release older than that one's own (an older app_ref must not move players back)."""
     out = {"state": "none", "release": "", "served": "", "served_listed": "false", "app_release": "",
-           "published_at": "", "codes": "[]"}
+           "published_at": "", "codes": "[]", "schemas": ""}
     for name, s in (("app sha", app_sha), ("dev sha", dev_sha)):
         if not SHA_RE.fullmatch(s or ""):
             raise SystemExit(f"{name}: not a full commit SHA: {s!r}")
@@ -191,6 +204,10 @@ def detect(cdn_path, app_pick, dev_pick, app_sha, dev_sha, candidate=None, want=
         raise SystemExit("dev has no server/overturepick.py: the corpus cannot run there on another release")
     doc, _ = read_switch(cdn_path)
     served, where = served_release(doc, app_rel)
+    floor = pick_release(floor_pick) if floor_pick else None
+    if floor and order(floor) > order(served):
+        served, where = floor, "the latest published release's own"
+    out["schemas"] = ",".join(pick_schemas(app_pick))
     latest, listed = listing if listing is not None else stac_listing(stac)
     want = (want or "").strip()
     new = want or latest
@@ -217,7 +234,8 @@ def detect(cdn_path, app_pick, dev_pick, app_sha, dev_sha, candidate=None, want=
 
 
 def cmd_detect(a):
-    outputs(detect(a.cdn, a.app_pick, a.dev_pick, a.app_sha, a.dev_sha, a.candidate, a.want))
+    outputs(detect(a.cdn, a.app_pick, a.dev_pick, a.app_sha, a.dev_sha, a.candidate, a.want,
+                   floor_pick=a.floor_pick or None))
     return 0
 
 
@@ -341,8 +359,22 @@ def read_gz_json(path, max_bytes=256 << 20):
     return json.loads(body)
 
 
-def check_stac(path, release, like=None):
-    """The STAC file's collections (dict) when it passes; SystemExit with the reason otherwise."""
+def upstream_counts(release, keys, stac=STAC):
+    """{"theme/type": file count} from Overture's own STAC collections (partition:file_count, and as many item links)."""
+    out = {}
+    for key in keys:
+        c = get_json(f"{stac}/{release}/{key}/collection.json", 8 << 20)
+        n = c.get("partition:file_count")
+        items = sum(1 for ln in c.get("links", ()) if isinstance(ln, dict) and ln.get("rel") == "item")
+        if not isinstance(n, int) or n != items:
+            raise SystemExit(f"Overture's STAC {key} of {release}: file count {n!r}, {items} items")
+        out[key] = n
+    return out
+
+
+def check_stac(path, release, like=None, upstream=None):
+    """The STAC file's collections (dict) when it passes; SystemExit with the reason otherwise. upstream: {"theme/type":
+    file count} of Overture's own STAC (upstream_counts) each collection must have exactly, with unique names."""
     if not valid(release):
         raise SystemExit(f"not a release id: {release!r}")
     if os.path.basename(path) != f"overture_stac_{release}.json.gz":
@@ -359,6 +391,11 @@ def check_stac(path, release, like=None):
             raise SystemExit(f"{path}: collection {key!r} is empty or not a collection")
         theme, typ = m.groups()
         prefix = f"/release/{release}/theme={theme}/type={typ}/"
+        names = [r[0] if isinstance(r, list) and r else None for r in c["files"]]
+        if len(set(map(str, names))) != len(names):
+            raise SystemExit(f"{path}: {key}: a file listed twice")
+        if upstream is not None and upstream.get(key) != len(names):
+            raise SystemExit(f"{path}: {key}: {len(names)} files, Overture's STAC lists {upstream.get(key)}")
         for row in c["files"]:
             if not (isinstance(row, list) and len(row) == 4):
                 raise SystemExit(f"{path}: {key}: a file row {str(row)[:200]}")
@@ -391,8 +428,13 @@ def check_stac(path, release, like=None):
     return cols
 
 
+def stac_keys(path):
+    return sorted(k for k in (read_gz_json(path).get("collections") or {}) if re.fullmatch(r"[a-z_]+/[a-z_]+", k))
+
+
 def cmd_check_stac(a):
-    cols = check_stac(a.file, a.release, a.like)
+    up = upstream_counts(a.release, stac_keys(a.file)) if a.upstream else None
+    cols = check_stac(a.file, a.release, a.like, up)
     print(f"{a.file}: {a.release}, {len(cols)} collections, {sum(len(c['files']) for c in cols.values())} files: ok")
     return 0
 
@@ -435,7 +477,8 @@ def cmd_stage_stac(a):
         raise SystemExit("not a release id")
     have = stac_files(a.tools)
     prev = have.get(a.served) or (have[max(have, key=order)] if have else None)
-    check_stac(a.file, a.release, prev if prev and os.path.basename(prev) != os.path.basename(a.file) else None)
+    check_stac(a.file, a.release, prev if prev and os.path.basename(prev) != os.path.basename(a.file) else None,
+               upstream_counts(a.release, stac_keys(a.file)))
     dst = os.path.join(a.tools, f"overture_stac_{a.release}.json.gz")
     shutil.copyfile(a.file, dst)
     print(f"staged {dst}")
@@ -462,9 +505,25 @@ def cmd_candidate(a):
 
 
 # --- gate -----------------------------------------------------------------------------------------------------------
+def stac_schema(release, fetch=get, stac=STAC):
+    """The schema:version Overture's STAC states for release when its root catalogue lists it, else None."""
+    try:
+        st, body = fetch(f"{stac}/catalog.json", 1 << 20)
+        root = json.loads(body) if st == 200 else {}
+        hrefs = {str(ln.get("href")) for ln in root.get("links", ()) if isinstance(ln, dict) and ln.get("rel") == "child"}
+        if f"{stac}/{release}/catalog.json" not in hrefs and f"./{release}/catalog.json" not in hrefs:
+            return None
+        st, body = fetch(f"{stac}/{release}/catalog.json", 1 << 20)
+        cat = json.loads(body) if st == 200 else {}
+        return str(cat.get("schema:version")) if cat.get("release:version") == release else None
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
 def gate(release, served, vkey, dec_format, bnwt_format, bnwt_names, schema_ok, published_at="", stuck_days=10.0,
-         pages=PAGES, cdn=CDN, now=None, fetch=get):
-    """(ready, [pending], stuck, [report lines])."""
+         pages=PAGES, cdn=CDN, now=None, fetch=get, schemas=None):
+    """(ready, [pending], stuck, [report lines]). schemas: the app's SUPPORTED_SCHEMAS (read as text from its
+    overturepick.py by detect, never from a job that ran app code): the live STAC must state one of them."""
     if not (valid(release) and valid(served) and VKEY_RE.fullmatch(vkey or "")):
         raise SystemExit("gate: a bad release or vkey")
     if not (re.fullmatch(r"\d{1,3}", dec_format) and re.fullmatch(r"\d{1,3}", bnwt_format)):
@@ -474,6 +533,10 @@ def gate(release, served, vkey, dec_format, bnwt_format, bnwt_names, schema_ok, 
             re.fullmatch(r"[a-z]+", k) and isinstance(v, str) and re.fullmatch(r"[a-z]+\.c\d+", v)
             for k, v in names.items())):
         raise SystemExit(f"gate: bnwt names {bnwt_names!r}")
+    if set(names) != BNWT_ARCHIVES or any(not v.startswith(k + ".c") for k, v in names.items()):
+        raise SystemExit(f"gate: bnwt names {bnwt_names!r} are not one name for each of {sorted(BNWT_ARCHIVES)}")
+    if not schemas or not all(re.fullmatch(r"\d+\.\d+\.\d+", x) for x in schemas):
+        raise SystemExit(f"gate: supported schemas {schemas!r}")
     pending, report = [], []
 
     def note(ok, gate_name, text):
@@ -482,6 +545,8 @@ def gate(release, served, vkey, dec_format, bnwt_format, bnwt_names, schema_ok, 
             pending.append(gate_name)
 
     note(schema_ok == "true", "schema", f"the app's overturepick.check_stac on {release}: {schema_ok}")
+    sv = stac_schema(release, fetch)
+    note(sv in schemas, "stac", f"Overture's STAC lists {release}: schema {sv} (the app reads {', '.join(schemas)})")
     st, body = fetch(f"{pages}/tallbld/manifest.json", 1 << 20)
     got = None
     if st == 200:
@@ -499,8 +564,8 @@ def gate(release, served, vkey, dec_format, bnwt_format, bnwt_names, schema_ok, 
         st, _ = fetch(f"{cdn}/bnwt{bnwt_format}/{served}/{name}.index.json", 1 << 20)
         if st == 200:
             built.append((arch, name))
-        elif st == 0:       # (no answer about the served release: not known whether BNWT is built)
-            note(False, "bnwt", f"{cdn}/bnwt{bnwt_format}/{served}/{name}.index.json: no answer")
+        elif st not in (404, 410):      # (no answer, or a denial: not known whether BNWT is built)
+            note(False, "bnwt", f"{cdn}/bnwt{bnwt_format}/{served}/{name}.index.json: HTTP {st}")
             break
     else:
         if not built:
@@ -522,7 +587,8 @@ def gate(release, served, vkey, dec_format, bnwt_format, bnwt_names, schema_ok, 
 
 def cmd_gate(a):
     ready, pending, stuck, report = gate(a.release, a.served, a.vkey, a.dec_format, a.bnwt_format, a.bnwt_names,
-                                         a.schema_ok, a.published_at, a.stuck_days, a.pages, a.cdn)
+                                         a.schema_ok, a.published_at, a.stuck_days, a.pages, a.cdn,
+                                         schemas=[x for x in a.schemas.split(",") if x])
     say(f"### Flip gate for {a.release}\n")
     say("\n".join(report))
     outputs({"ready": "true" if ready else "false", "pending": " ".join(pending), "stuck": "true" if stuck else "false"})
@@ -605,6 +671,11 @@ def flip_text(text, release):
 def cmd_flip_cdn(a):
     with open(a.file, encoding="utf-8") as f:
         text = f.read(SWITCH_MAX + 1)
+    if a.expect_served:         # (cdn.json changed since the gate was checked against the served release: not flipped)
+        on = json.loads(text).get("overture")
+        cur = on.get("release") if isinstance(on, dict) else None
+        if on is not None and cur not in (a.expect_served, a.release):
+            raise SystemExit(f"cdn.json names {cur!r} now, not the {a.expect_served} the gate was checked against")
     new = flip_text(text, a.release)
     if new == text:
         print(f"{a.file}: names {a.release} already")
@@ -628,6 +699,7 @@ def main():
     p.add_argument("--dev-sha", required=True)
     p.add_argument("--candidate", default="")
     p.add_argument("--want", default="")
+    p.add_argument("--floor-pick", default="", help="the latest published release's overturepick.py / overture.py")
     p = sub.add_parser("corpus")
     p.add_argument("--corpus", required=True)
     p.add_argument("--release", required=True)
@@ -646,6 +718,8 @@ def main():
         p.add_argument("file")
         p.add_argument("--release", required=True)
         p.add_argument("--like", default=None)
+        if name == "check-stac":
+            p.add_argument("--upstream", action="store_true", help="file counts against Overture's own STAC")
     p = sub.add_parser("stage-stac")
     p.add_argument("file")
     p.add_argument("--release", required=True)
@@ -658,12 +732,14 @@ def main():
     for k in ("--release", "--served", "--vkey", "--dec-format", "--bnwt-format", "--bnwt-names", "--schema-ok"):
         p.add_argument(k, required=True)
     p.add_argument("--published-at", default="")
+    p.add_argument("--schemas", required=True, help="the app's SUPPORTED_SCHEMAS, comma-separated (detect's)")
     p.add_argument("--stuck-days", type=float, default=10.0)
     p.add_argument("--pages", default=PAGES)
     p.add_argument("--cdn", default=CDN)
     p = sub.add_parser("flip-cdn")
     p.add_argument("file")
     p.add_argument("--release", required=True)
+    p.add_argument("--expect-served", default="", help="refuse when cdn.json names another release than this")
     a = ap.parse_args()
     return {"detect": cmd_detect, "corpus": cmd_corpus, "check-stac": cmd_check_stac, "check-places": cmd_check_places,
             "stage-stac": cmd_stage_stac, "candidate": cmd_candidate, "gate": cmd_gate,

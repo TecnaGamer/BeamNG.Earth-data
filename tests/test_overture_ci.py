@@ -46,24 +46,34 @@ class FlipTest(unittest.TestCase):
 
 
 class DetectTest(unittest.TestCase):
-    def run_detect(self, cdn, app_rel='2026-11-18.0', dev=True, cand=None, want='', listed=None, latest='2026-12-16.0'):
+    def run_detect(self, cdn, app_rel='2026-11-18.0', dev=True, cand=None, want='', listed=None, latest='2026-12-16.0',
+                   floor=None):
         with tempfile.TemporaryDirectory() as tmp:
             t = Path(tmp)
             (t / 'cdn.json').write_text(json.dumps(cdn))
-            (t / 'app.py').write_text(f'x = 1\nRELEASE = "{app_rel}"\n')
+            (t / 'app.py').write_text(f'x = 1\nRELEASE = "{app_rel}"\nSUPPORTED_SCHEMAS = ("2.0.0", "2.1.0")\n')
+            if floor:
+                (t / 'floor.py').write_text(f'RELEASE = "{floor}"\n')
             if dev:
                 (t / 'dev.py').write_text('RELEASE = "2026-11-18.0"\n')
             if cand is not None:
                 (t / 'cand.json').write_text(json.dumps(cand))
             listed = listed if listed is not None else {'2026-10-21.0', '2026-11-18.0', '2026-12-16.0'}
             return ci.detect(t / 'cdn.json', t / 'app.py', t / 'dev.py', APP, DEV, t / 'cand.json', want,
-                             listing=(latest, listed))
+                             listing=(latest, listed), floor_pick=t / 'floor.py' if floor else None)
 
     def test_new_release_over_the_apps_own(self):
         out = self.run_detect({})
         self.assertEqual((out['state'], out['release'], out['served'], out['served_listed']),
                          ('new', '2026-12-16.0', '2026-11-18.0', 'true'))
         self.assertEqual(json.loads(out['codes']), ['app', 'dev'])
+        self.assertEqual(out['schemas'], '2.0.0,2.1.0')
+
+    def test_never_below_the_latest_published_release(self):
+        out = self.run_detect({}, app_rel='2026-10-21.0', floor='2026-12-16.0')     # (an older app_ref)
+        self.assertEqual((out['state'], out['served']), ('none', '2026-12-16.0'))
+        out = self.run_detect({}, app_rel='2026-10-21.0', floor='2026-11-18.0')
+        self.assertEqual((out['state'], out['served']), ('new', '2026-11-18.0'))
 
     def test_nothing_when_served_is_latest_or_newer(self):
         self.assertEqual(self.run_detect({'overture': {'release': '2026-12-16.0'}})['state'], 'none')
@@ -97,26 +107,32 @@ class DetectTest(unittest.TestCase):
 
 
 class GateTest(unittest.TestCase):
-    NAMES = json.dumps({'base': 'base.c1', 'places': 'places.c1'})
+    NAMES = json.dumps({'base': 'base.c1', 'places': 'places.c1', 'buildings': 'buildings.c1',
+                        'transportation': 'transportation.c1'})
+    ARCH = ('base.c1', 'places.c1', 'buildings.c1', 'transportation.c1')
 
     def fetch_with(self, answers):
         def fetch(url, max_bytes):
             return answers.get(url, (404, b''))
         return fetch
 
-    def answers(self, tall='2026-12-16.0', dec=True, bnwt_old=False, bnwt_new=False):
-        a = {f'{ci.PAGES}/tallbld/manifest.json': (200, json.dumps({'release': tall, 'parts': [{}]}).encode())}
+    def answers(self, tall='2026-12-16.0', dec=True, bnwt_old=False, bnwt_new=False, schema='2.0.0'):
+        a = {f'{ci.PAGES}/tallbld/manifest.json': (200, json.dumps({'release': tall, 'parts': [{}]}).encode()),
+             f'{ci.STAC}/catalog.json': (200, json.dumps({'links': [
+                 {'rel': 'child', 'href': f'{ci.STAC}/2026-12-16.0/catalog.json'}]}).encode()),
+             f'{ci.STAC}/2026-12-16.0/catalog.json': (200, json.dumps({
+                 'release:version': '2026-12-16.0', 'schema:version': schema}).encode())}
         if dec:
             a[f'{ci.CDN}/dec/d2/{"c" * 32}/manifest.bngm'] = (200, b'BNGM....')
         for rel, on in (('2026-11-18.0', bnwt_old), ('2026-12-16.0', bnwt_new)):
             if on:
-                for n in ('base.c1', 'places.c1'):
+                for n in self.ARCH:
                     a[f'{ci.CDN}/bnwt2/{rel}/{n}.index.json'] = (200, b'{}')
         return a
 
     def gate(self, answers, schema='true', at='', now=None):
         return ci.gate('2026-12-16.0', '2026-11-18.0', 'c' * 32, '2', '2', self.NAMES, schema, at, 10.0,
-                       now=now, fetch=self.fetch_with(answers))
+                       now=now, fetch=self.fetch_with(answers), schemas=['2.0.0'])
 
     def test_ready_only_with_every_gate(self):
         self.assertEqual(self.gate(self.answers())[:2], (True, []))
@@ -125,10 +141,14 @@ class GateTest(unittest.TestCase):
         self.assertEqual(self.gate(self.answers(), schema='false')[:2], (False, ['schema']))
         self.assertEqual(self.gate(self.answers(bnwt_old=True))[:2], (False, ['bnwt']))
         self.assertEqual(self.gate(self.answers(bnwt_old=True, bnwt_new=True))[:2], (True, []))
+        self.assertEqual(self.gate(self.answers(schema='3.0.0'))[:2], (False, ['stac']))
 
     def test_no_answer_is_not_ready(self):
         a = self.answers()
         a[f'{ci.CDN}/bnwt2/2026-11-18.0/base.c1.index.json'] = (0, 'timeout')
+        self.assertEqual(self.gate(a)[:2], (False, ['bnwt']))
+        a = self.answers()
+        a[f'{ci.CDN}/bnwt2/2026-11-18.0/base.c1.index.json'] = (403, b'')     # (a denial is not "not built")
         self.assertEqual(self.gate(a)[:2], (False, ['bnwt']))
         a = self.answers()
         a[f'{ci.CDN}/dec/d2/{"c" * 32}/manifest.bngm'] = (200, b'<html>')
@@ -142,9 +162,12 @@ class GateTest(unittest.TestCase):
 
     def test_bad_inputs(self):
         with self.assertRaises(SystemExit):
-            ci.gate('2026-12-16.0', '2026-11-18.0', '../x', '2', '2', self.NAMES, 'true')
+            ci.gate('2026-12-16.0', '2026-11-18.0', '../x', '2', '2', self.NAMES, 'true', schemas=['2.0.0'])
         with self.assertRaises(SystemExit):
-            ci.gate('2026-12-16.0', '2026-11-18.0', 'c' * 32, '2', '2', '{"base": "../x"}', 'true')
+            ci.gate('2026-12-16.0', '2026-11-18.0', 'c' * 32, '2', '2', '{"base": "../x"}', 'true', schemas=['2.0.0'])
+        with self.assertRaises(SystemExit):     # (an incomplete BNWT set would skip the missing archives)
+            ci.gate('2026-12-16.0', '2026-11-18.0', 'c' * 32, '2', '2', '{"base": "base.c1"}', 'true',
+                    schemas=['2.0.0'])
 
 
 class StacTest(unittest.TestCase):
@@ -166,7 +189,13 @@ class StacTest(unittest.TestCase):
         good = f'https://overturemaps-us-west-2.s3.us-west-2.amazonaws.com/release/{rel}/theme=base/type=water/{name}'
         row = [name, [-1.0, -1.0, 1.0, 1.0], [good], 10]
         with tempfile.TemporaryDirectory() as tmp:
-            ci.check_stac(self.write(tmp, rel, {'release': rel, 'collections': {'base/water': {'files': [row]}}}), rel)
+            ok = self.write(tmp, rel, {'release': rel, 'collections': {'base/water': {'files': [row]}}})
+            ci.check_stac(ok, rel, upstream={'base/water': 1})
+            with self.assertRaises(SystemExit):
+                ci.check_stac(ok, rel, upstream={'base/water': 2})
+            with self.assertRaises(SystemExit):
+                ci.check_stac(self.write(tmp, rel, {'release': rel, 'collections': {'base/water': {'files': [row, row]}}}),
+                              rel)
             for bad in ({'release': rel, 'collections': {'base/water': {'files': []}}},
                         {'release': '2026-11-18.0', 'collections': {'base/water': {'files': [row]}}},
                         {'release': rel, 'collections': {'base/water': {'files': [
