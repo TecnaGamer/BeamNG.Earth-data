@@ -1,0 +1,462 @@
+# The automatic Overture update (BeamNG.Earth server/overturepick.py; the user's go, 2026-11-18): a new Overture release
+# reaches players through cdn.json {"overture": {"release": "<id>"}} only after it was checked and its products are
+# on the tile host. Players' apps read the key at their start and take it only when Overture's STAC lists it with a
+# schema they read; apps from before overturepick.py ignore it.
+#
+#   detect     daily + by hand: STAC's latest (or `release`), a strict id, newer than the release served (cdn.json's,
+#              else the app's own RELEASE); never backwards. state: none / new / published (candidate already out)
+#   validate   [no secrets, read-only] per app tree (the latest published release, and dev): the app's own
+#              overturepick.check_stac (listed, supported schema); the 8-place portcheck corpus online on the served
+#              release and on the new one; every place planned on the release asked, no cell errors, per-layer counts
+#              within bounds (tools/overture_appcode.py counts -> tools/overture_ci.py corpus)
+#   products   [no secrets, read-only] the tall index's STAC (build_stac_index.py) and the places snapshot (artifact),
+#              both checked (release field, every collection non-empty, URLs on Overture's own hosts)
+#   publish    [contents + actions write; this repo's stdlib checker, git, gh only] the STAC into tools/ (checked again),
+#              candidates branch overture.json {release, app_tag, app_sha} for the mini PC's decision builder,
+#              dispatches rail.yml (its tallbld job rebuilds the tall index from the newest STAC) and bnwt.yml
+#   gate       [no secrets, read-only] the app's own vkey of the decision archives for the new release, its schema
+#              check again, the BNWT index names
+#   gatecheck  [read-only, stdlib] the tall index on Pages names the release, the decisions manifest of that vkey
+#              answers on tiles.tgforever.net, the BNWT indexes answer when the served release has them
+#   flip       [contents write, stdlib] only when gatecheck is ready, not a dry run, on main: the gate checked again,
+#              then cdn.json's overture key by a minimal edit (other keys byte-identical). Not ready: nothing; the
+#              next daily run (state published) checks again
+#   notify     [issues write] one issue when a step failed or the gate waits for more than 10 days (never twice)
+#
+# Inputs (by hand): dry_run (everything but publish and flip), release (blank: STAC's latest), app_ref (blank: the
+# latest published release; a release tag). Rollback: commit cdn.json back to the previous release (Overture keeps a
+# release ~60 days); never remove the key while players' builds ship an older RELEASE that Overture deleted.
+name: overture
+
+on:
+  schedule:
+    - cron: "40 6 * * *"            # daily (Overture publishes around the third Wednesday)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "run every check, build nothing into the repo, flip nothing"
+        type: boolean
+        default: false
+      release:
+        description: "an Overture release id to bring in (blank: STAC's latest)"
+        default: ""
+      app_ref:
+        description: "BeamNG.Earth release tag the products are for (blank: the latest published release)"
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: overture
+  cancel-in-progress: false
+
+env:
+  CODE_REPO: TecnaGamer/BeamNG.Earth
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      state: ${{ steps.d.outputs.state }}
+      release: ${{ steps.d.outputs.release }}
+      served: ${{ steps.d.outputs.served }}
+      served_listed: ${{ steps.d.outputs.served_listed }}
+      published_at: ${{ steps.d.outputs.published_at }}
+      codes: ${{ steps.d.outputs.codes }}
+      app_tag: ${{ steps.refs.outputs.app_tag }}
+      app_sha: ${{ steps.refs.outputs.app_sha }}
+      dev_sha: ${{ steps.refs.outputs.dev_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - id: refs
+        name: "The app release and dev, pinned to commits; their overturepick.py as text; the candidate"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_REF: ${{ github.event.inputs.app_ref }}
+        run: |
+          set -euo pipefail
+          REF="$APP_REF"
+          if [ -z "$REF" ]; then REF=$(gh api "repos/$CODE_REPO/releases/latest" --jq .tag_name); fi
+          [[ "$REF" =~ ^v[0-9][0-9A-Za-z.+-]{0,63}$ ]] || { echo "::error::app_ref must be a release tag: $REF"; exit 1; }
+          SHA=$(gh api "repos/$CODE_REPO/commits/$REF" --jq .sha)
+          DEV=$(gh api "repos/$CODE_REPO/commits/dev" --jq .sha)
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ && "$DEV" =~ ^[0-9a-f]{40}$ ]]
+          { echo "app_tag=$REF"; echo "app_sha=$SHA"; echo "dev_sha=$DEV"; } >> "$GITHUB_OUTPUT"
+          echo "BeamNG.Earth $REF = $SHA; dev = $DEV" | tee -a "$GITHUB_STEP_SUMMARY"
+          for w in "app $SHA" "dev $DEV"; do
+            set -- $w
+            code=$(curl -sS -o "pick-$1.py" -w '%{http_code}' "https://raw.githubusercontent.com/$CODE_REPO/$2/server/overturepick.py")
+            case "$code" in
+              200) ;;
+              404) rm -f "pick-$1.py"; echo "$1: no server/overturepick.py" ;;
+              *) echo "::error::$1's overturepick.py: HTTP $code"; exit 1 ;;
+            esac
+          done
+          if git fetch -q --depth 1 origin candidates 2>/dev/null; then git show FETCH_HEAD:overture.json > candidate.json || rm -f candidate.json; fi
+      - id: d
+        name: "A newer release?"
+        env:
+          WANT: ${{ github.event.inputs.release }}
+          APP_SHA: ${{ steps.refs.outputs.app_sha }}
+          DEV_SHA: ${{ steps.refs.outputs.dev_sha }}
+        run: |
+          set -euo pipefail
+          python3 tools/overture_ci.py detect --cdn cdn.json --app-pick pick-app.py --dev-pick pick-dev.py \
+            --app-sha "$APP_SHA" --dev-sha "$DEV_SHA" --candidate candidate.json --want "$WANT" 2> detect.log > out.txt \
+            || rc=$?
+          cat detect.log out.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "${rc:-0}" = 0 ] || exit "$rc"
+          cat out.txt >> "$GITHUB_OUTPUT"
+
+  validate:
+    # (no secrets, read-only token: runs the app's code and its dependencies)
+    needs: detect
+    if: needs.detect.outputs.state == 'new'
+    strategy:
+      fail-fast: false
+      matrix:
+        code: ${{ fromJson(needs.detect.outputs.codes) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          path: data
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          repository: ${{ env.CODE_REPO }}
+          ref: ${{ matrix.code == 'dev' && needs.detect.outputs.dev_sha || needs.detect.outputs.app_sha }}
+          path: code
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
+        with:
+          python-version: "3.12"
+      - name: Dependencies
+        run: python -m pip install -q -r code/server/requirements.txt "duckdb==1.5.6"
+      - name: "Schema and listing (the app's own overturepick.check_stac)"
+        env:
+          REL: ${{ needs.detect.outputs.release }}
+        run: python data/tools/overture_appcode.py schema --tree code --release "$REL" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: "The corpus on the served release and on the new one (fresh caches)"
+        env:
+          NEW: ${{ needs.detect.outputs.release }}
+          OLD: ${{ needs.detect.outputs.served }}
+          OLD_LISTED: ${{ needs.detect.outputs.served_listed }}
+        run: |
+          set -uo pipefail
+          RS="$NEW"; [ "$OLD_LISTED" = true ] && RS="$OLD $NEW"
+          for R in $RS; do
+            [[ "$R" =~ ^20[2-9][0-9]-[0-9]{2}-[0-9]{2}\.[0-9]{1,2}$ ]] || { echo "bad release $R"; exit 1; }
+            echo "::group::corpus on $R"
+            BNGE_OVERTURE_RELEASE="$R" python code/tools/portcheck/build.py --online --cache "$RUNNER_TEMP/c-$R" \
+              --out "out-$R" 2>&1 | tee "build-$R.txt"
+            BNGE_OVERTURE_RELEASE="$R" python data/tools/overture_appcode.py counts --tree code \
+              --cache "$RUNNER_TEMP/c-$R" --plans "out-$R" --out "counts-$R.json" 2>&1 | tail -20
+            echo "::endgroup::"
+          done
+          exit 0      # (the next step judges)
+      - name: "Every place planned, no errors, counts within bounds"
+        env:
+          NEW: ${{ needs.detect.outputs.release }}
+          OLD: ${{ needs.detect.outputs.served }}
+          OLD_LISTED: ${{ needs.detect.outputs.served_listed }}
+        run: |
+          set -euo pipefail
+          OLDARGS=()
+          if [ "$OLD_LISTED" = true ]; then
+            OLDARGS=(--old-release "$OLD" --old-out "out-$OLD" --old-log "build-$OLD.txt" --old-counts "counts-$OLD.json")
+          fi
+          python3 data/tools/overture_ci.py corpus --corpus code/tools/portcheck/corpus.json --release "$NEW" \
+            --out "out-$NEW" --log "build-$NEW.txt" --counts "counts-$NEW.json" "${OLDARGS[@]}" > check.md || rc=$?
+          cat check.md | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "${rc:-0}"
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: corpus-${{ matrix.code }}
+          path: |
+            out-*/plans/*/index.json
+            out-*/build-*.log
+            build-*.txt
+            counts-*.json
+            check.md
+          retention-days: 14
+
+  products:
+    # (no secrets, read-only token: runs the app's code)
+    needs: detect
+    if: needs.detect.outputs.state == 'new'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          path: data
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          repository: ${{ env.CODE_REPO }}
+          ref: ${{ needs.detect.outputs.app_sha }}
+          path: code
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
+        with:
+          python-version: "3.12"
+      - name: Dependencies
+        run: python -m pip install -q -r code/server/requirements.txt "duckdb==1.5.6"
+      - name: "The tall index's STAC and the places snapshot, checked"
+        env:
+          REL: ${{ needs.detect.outputs.release }}
+        run: |
+          set -euo pipefail
+          mkdir -p products
+          python code/tools/build_stac_index.py --cache "$RUNNER_TEMP/c" --release "$REL" \
+            --out "products/overture_stac_$REL.json.gz"
+          python code/tools/build_places.py --release "$REL" --output "products/places_$REL.json.gz"
+          # (compared with the newest STAC in tools/ and the app's own places snapshot, when there are)
+          PREV=$( (ls data/tools/overture_stac_*.json.gz 2>/dev/null || true) | sort -V | tail -1)
+          LIKE=$( (ls code/server/data/places_*.json.gz 2>/dev/null || true) | sort -V | tail -1)
+          python3 data/tools/overture_ci.py check-stac "products/overture_stac_$REL.json.gz" --release "$REL" \
+            ${PREV:+--like "$PREV"} | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 data/tools/overture_ci.py check-places "products/places_$REL.json.gz" --release "$REL" \
+            ${LIKE:+--like "$LIKE"} | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: products
+          path: products
+          retention-days: 30
+          if-no-files-found: error
+
+  publish:
+    # (this repo's stdlib checker, git and gh only: no app code in a job that can write)
+    needs: [detect, validate, products]
+    if: >-
+      ${{ needs.detect.outputs.state == 'new' && needs.validate.result == 'success' &&
+      needs.products.result == 'success' && github.event.inputs.dry_run != 'true' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write         # (the STAC commit on main, the candidates branch)
+      actions: write          # (dispatches rail.yml and bnwt.yml)
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          ref: main
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: products
+          path: ${{ runner.temp }}/in
+      - name: "The STAC into tools/ (checked again), committed"
+        env:
+          REL: ${{ needs.detect.outputs.release }}
+          SERVED: ${{ needs.detect.outputs.served }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python3 tools/overture_ci.py stage-stac "$RUNNER_TEMP/in/overture_stac_$REL.json.gz" --release "$REL" \
+            --served "$SERVED" --tools tools | tee -a "$GITHUB_STEP_SUMMARY"
+          git add -A -- tools/
+          if git diff --cached --quiet; then echo "the STAC of $REL is in tools/ already"; exit 0; fi
+          git commit -q -m "Tall-building index: Overture $REL's STAC (overture workflow, run $GITHUB_RUN_ID)"
+          pushed=false
+          for i in 1 2 3; do
+            if git push -q origin HEAD:main; then pushed=true; break; fi
+            sleep $((i * 10)); git pull -q --rebase origin main
+          done
+          $pushed
+      - name: "The candidate for the mini PC's decision builder (candidates branch)"
+        env:
+          REL: ${{ needs.detect.outputs.release }}
+          SERVED: ${{ needs.detect.outputs.served }}
+          APP_TAG: ${{ needs.detect.outputs.app_tag }}
+          APP_SHA: ${{ needs.detect.outputs.app_sha }}
+        run: |
+          set -euo pipefail
+          python3 tools/overture_ci.py candidate --release "$REL" --served "$SERVED" --app-tag "$APP_TAG" \
+            --app-sha "$APP_SHA" --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --out "$RUNNER_TEMP/overture.json" | tee -a "$GITHUB_STEP_SUMMARY"
+          C="$RUNNER_TEMP/cand"
+          if git ls-remote --exit-code --heads origin candidates >/dev/null; then
+            git fetch -q --depth 1 origin candidates
+            git worktree add -q --detach "$C" FETCH_HEAD
+          else
+            git worktree add -q --detach "$C" HEAD
+            git -C "$C" switch -q --orphan candidates-new
+          fi
+          cp "$RUNNER_TEMP/overture.json" "$C/overture.json"
+          git -C "$C" add overture.json
+          git -C "$C" commit -q -m "Candidate: Overture $REL for BeamNG.Earth $APP_TAG ($APP_SHA)"
+          git -C "$C" push -q origin HEAD:refs/heads/candidates
+      - name: "The builds: rail.yml (its tallbld job takes the newest STAC) and bnwt.yml"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REL: ${{ needs.detect.outputs.release }}
+          APP_SHA: ${{ needs.detect.outputs.app_sha }}
+        run: |
+          set -euo pipefail
+          got=$(curl -sS https://tecnagamer.github.io/BeamNG.Earth-data/tallbld/manifest.json \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin).get("release", ""))' || true)
+          if [ "$got" = "$REL" ]; then echo "tallbld names $REL already"; else gh workflow run rail.yml --ref main; fi
+          gh workflow run bnwt.yml --ref main -f release="$REL" -f code_ref="$APP_SHA"
+
+  gate:
+    # (no secrets, read-only token: the app's own code computes the decision archives' version key)
+    needs: [detect, validate, products, publish]
+    if: >-
+      ${{ !cancelled() && needs.detect.result == 'success' && (needs.detect.outputs.state == 'published' ||
+      (needs.detect.outputs.state == 'new' && (needs.publish.result == 'success' ||
+      (github.event.inputs.dry_run == 'true' && needs.validate.result == 'success' && needs.products.result == 'success')))) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      schema_ok: ${{ steps.g.outputs.schema_ok }}
+      vkey: ${{ steps.g.outputs.vkey }}
+      dec_format: ${{ steps.g.outputs.dec_format }}
+      bnwt_format: ${{ steps.g.outputs.bnwt_format }}
+      bnwt_names: ${{ steps.g.outputs.bnwt_names }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          path: data
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          repository: ${{ env.CODE_REPO }}
+          ref: ${{ needs.detect.outputs.app_sha }}
+          path: code
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
+        with:
+          python-version: "3.12"
+      - name: Dependencies
+        run: python -m pip install -q -r code/server/requirements.txt "duckdb==1.5.6"
+      - id: g
+        name: "The app's vkey for the new release, its schema check, the BNWT names"
+        env:
+          REL: ${{ needs.detect.outputs.release }}
+        run: |
+          set -euo pipefail
+          python data/tools/overture_appcode.py gate-info --tree code --release "$REL" --cache "$RUNNER_TEMP/vk" \
+            2> gate.log > out.txt || rc=$?
+          tail -20 gate.log; cat out.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "${rc:-0}" = 0 ] || exit "$rc"
+          grep -E '^(schema_ok|vkey|dec_format|bnwt_format|bnwt_names)=' out.txt >> "$GITHUB_OUTPUT"
+
+  gatecheck:
+    # (read-only, this repo's stdlib checker: every gate on the live hosts)
+    needs: [detect, gate]
+    if: ${{ !cancelled() && needs.gate.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      ready: ${{ steps.c.outputs.ready }}
+      pending: ${{ steps.c.outputs.pending }}
+      stuck: ${{ steps.c.outputs.stuck }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - id: c
+        env:
+          REL: ${{ needs.detect.outputs.release }}
+          SERVED: ${{ needs.detect.outputs.served }}
+          AT: ${{ needs.detect.outputs.published_at }}
+          SCHEMA_OK: ${{ needs.gate.outputs.schema_ok }}
+          VKEY: ${{ needs.gate.outputs.vkey }}
+          DEC_FORMAT: ${{ needs.gate.outputs.dec_format }}
+          BNWT_FORMAT: ${{ needs.gate.outputs.bnwt_format }}
+          BNWT_NAMES: ${{ needs.gate.outputs.bnwt_names }}
+        run: |
+          set -euo pipefail
+          python3 tools/overture_ci.py gate --release "$REL" --served "$SERVED" --vkey "$VKEY" \
+            --dec-format "$DEC_FORMAT" --bnwt-format "$BNWT_FORMAT" --bnwt-names "$BNWT_NAMES" \
+            --schema-ok "$SCHEMA_OK" --published-at "$AT" 2> gate.md > out.txt || rc=$?
+          cat gate.md out.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "${rc:-0}" = 0 ] || exit "$rc"
+          cat out.txt >> "$GITHUB_OUTPUT"
+
+  flip:
+    # (this repo's stdlib checker and git only) the gate checked again just before the commit
+    needs: [detect, gate, gatecheck]
+    if: >-
+      ${{ !cancelled() && needs.gatecheck.result == 'success' && needs.gatecheck.outputs.ready == 'true' &&
+      github.event.inputs.dry_run != 'true' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          ref: main
+      - name: "Every gate again, then cdn.json's overture key"
+        env:
+          REL: ${{ needs.detect.outputs.release }}
+          SERVED: ${{ needs.detect.outputs.served }}
+          SCHEMA_OK: ${{ needs.gate.outputs.schema_ok }}
+          VKEY: ${{ needs.gate.outputs.vkey }}
+          DEC_FORMAT: ${{ needs.gate.outputs.dec_format }}
+          BNWT_FORMAT: ${{ needs.gate.outputs.bnwt_format }}
+          BNWT_NAMES: ${{ needs.gate.outputs.bnwt_names }}
+        run: |
+          set -euo pipefail
+          python3 tools/overture_ci.py gate --release "$REL" --served "$SERVED" --vkey "$VKEY" \
+            --dec-format "$DEC_FORMAT" --bnwt-format "$BNWT_FORMAT" --bnwt-names "$BNWT_NAMES" \
+            --schema-ok "$SCHEMA_OK" 2> gate.md > out.txt || rc=$?
+          cat gate.md out.txt
+          [ "${rc:-0}" = 0 ] || exit "$rc"
+          grep -qx 'ready=true' out.txt || { echo "::warning::not ready on the second check: nothing flipped"; exit 0; }
+          cp tools/overture_ci.py "$RUNNER_TEMP/overture_ci.py"     # (the checker as checked out, not as rebased)
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for i in 1 2 3; do
+            git fetch -q origin main && git reset -q --hard origin/main
+            python3 "$RUNNER_TEMP/overture_ci.py" flip-cdn cdn.json --release "$REL" | tee -a "$GITHUB_STEP_SUMMARY"
+            if git diff --quiet -- cdn.json; then echo "cdn.json names $REL already"; exit 0; fi
+            git commit -q -m "cdn.json: Overture $REL for every player (overture workflow, run $GITHUB_RUN_ID: STAC, corpus, tall index, decision archives $VKEY)" -- cdn.json
+            if git push -q origin HEAD:main; then exit 0; fi
+            sleep $((i * 10))
+          done
+          exit 1
+
+  notify:
+    needs: [detect, validate, products, publish, gate, gatecheck, flip]
+    if: >-
+      ${{ !cancelled() && github.event.inputs.dry_run != 'true' &&
+      (failure() || needs.gatecheck.outputs.stuck == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      - name: "One issue (never twice)"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REL: ${{ needs.detect.outputs.release }}
+          FAILED: ${{ contains(needs.*.result, 'failure') }}
+          PENDING: ${{ needs.gatecheck.outputs.pending }}
+          AT: ${{ needs.detect.outputs.published_at }}
+        run: |
+          set -euo pipefail
+          [[ "$REL" =~ ^20[2-9][0-9]-[0-9]{2}-[0-9]{2}\.[0-9]{1,2}$ ]] || REL="(no release)"
+          [[ "$PENDING" =~ ^[a-z\ ]*$ ]] || PENDING="(unreadable)"
+          [[ "$AT" =~ ^[0-9T:Z-]*$ ]] || AT=""
+          RUN="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [ "$FAILED" = true ]; then
+            TITLE="Overture update $REL: a step failed"
+            BODY="The overture workflow stopped: $RUN. Nothing was flipped; cdn.json is unchanged. The next daily run tries again; close this issue once it is fixed."
+          else
+            TITLE="Overture update $REL: the flip gate is waiting for more than 10 days"
+            BODY="The candidate for Overture $REL was published $AT and the flip gate still waits for: $PENDING ($RUN). tallbld: rail.yml's tallbld job; decisions: the mini PC's bnge-overture-candidate timer (its done marker, journalctl --user -u bnge-overture-candidate); bnwt: bnwt.yml."
+          fi
+          if gh issue list -R "$GITHUB_REPOSITORY" --state open --limit 200 --json title --jq '.[].title' | grep -Fxq -- "$TITLE"; then
+            echo "an open issue says so already: $TITLE"
+            exit 0
+          fi
+          gh issue create -R "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY"

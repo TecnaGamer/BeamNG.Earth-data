@@ -120,6 +120,34 @@ part against its shard's record before upload, and an archive's index is written
 The server reads them when `BNGE_BNWT_URL` is `https://tiles.tgforever.net`. Data © OpenStreetMap contributors,
 Overture Maps Foundation.
 
+## cdn.json "overture": the Overture release players read (daily, workflow "overture")
+
+BeamNG.Earth reads the map data from one Overture release. A build ships its own (`server/overturepick.py`
+`RELEASE`), and from the builds with `overturepick.py` on, `cdn.json`'s `{"overture": {"release": "<id>"}}` moves
+every player to a newer one at their next app start, once Overture's STAC lists it with a schema that build reads
+(older builds ignore the key). The `overture` workflow sets the key only after the release passed every check and
+its products are on the tile host:
+
+1. **detect** (daily, or by hand): STAC's latest release, newer than the one served (`cdn.json`'s, else the latest
+   published app's own); never backwards.
+2. **validate** and **products** (no secrets, read-only): the app's own schema check, the 8-place corpus
+   (BeamNG.Earth `tools/portcheck`) online on the served and the new release with the latest published app and with
+   dev (every place planned, no errors, per-layer counts within bounds: `tools/overture_appcode.py counts`,
+   `tools/overture_ci.py corpus`), the tall index's STAC and the places snapshot.
+3. **publish**: the STAC into `tools/` (the tall-building job of `rail.yml` takes the newest), `rail.yml` and
+   `bnwt.yml` dispatched, and `overture.json` (release, app tag and commit) on the `candidates` branch. The project's
+   mini PC (timer `bnge-overture-candidate`) reads that branch, builds the signed decision archives for that app tag
+   with the new release (the signing key never leaves that box) and uploads them, manifest last.
+4. **flip** (re-checked daily): only when `tallbld/manifest.json` names the release, the decision archives' manifest
+   for the app's version key (computed by the app's own code) answers on the tile host, and the BNWT indexes answer
+   if the served release has them: one commit to `cdn.json` that changes only the `overture` key.
+5. An issue is opened when a step fails or the gate waits for more than 10 days (one per release and cause).
+
+`dry_run` (by hand) runs every check and builds nothing into the repo. **Rollback:** commit `cdn.json` back to the
+previous release (Overture keeps releases about 60 days); don't remove the key while players' builds ship a release
+Overture has deleted. Only `tools/overture_ci.py` (standard library) runs in the jobs that can write to this repo;
+BeamNG.Earth's code runs only in jobs without secrets and with a read-only token.
+
 ## addons.json: the in-game Add-ons page's list (edited by hand)
 The add-ons BeamNG.Earth's Add-ons page offers and lets players install (server/addons.py, REGISTRY_URL; read through
 raw.githubusercontent.com, not the Pages site, so editing it needs no data build). Every edit reaches players within a
