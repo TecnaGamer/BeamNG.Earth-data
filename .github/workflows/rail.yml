@@ -46,7 +46,11 @@ jobs:
       - name: Tools
         run: pip install "osmium==4.3.2" numpy
       - name: "The builder (tools/build_rail_tags.py from BeamNG.Earth)"
-        run: curl -sfL -o build_rail_tags.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/tools/build_rail_tags.py
+        run: |
+          # (tools/npyfirst.py + server/npyguard.py beside the builder: its "import npyfirst" holds numpy's AVX-512 kernels
+          # back, so a runner on an AVX-512 CPU builds the same bytes as an AVX2 one; without them the import was skipped)
+          for f in tools/npyfirst.py server/npyguard.py; do curl -sfL -o "$(basename "$f")" "https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/$f"; done
+          curl -sfL -o build_rail_tags.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/tools/build_rail_tags.py
       - name: "FRA level crossings (tools/build_fra_shards.py)"
         continue-on-error: true
         run: |
@@ -74,6 +78,9 @@ jobs:
         run: pip install "osmium==4.3.2" numpy
       - name: "The builder (tools/build_lane_tags.py from BeamNG.Earth, with build_rail_tags.py it uses)"
         run: |
+          # (tools/npyfirst.py + server/npyguard.py beside the builder: its "import npyfirst" holds numpy's AVX-512 kernels
+          # back, so a runner on an AVX-512 CPU builds the same bytes as an AVX2 one; without them the import was skipped)
+          for f in tools/npyfirst.py server/npyguard.py; do curl -sfL -o "$(basename "$f")" "https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/$f"; done
           curl -sfL -o build_rail_tags.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/tools/build_rail_tags.py
           curl -sfL -o build_lane_tags.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/tools/build_lane_tags.py
       - name: Build
@@ -99,7 +106,7 @@ jobs:
       - name: "The builder (tools/build_sign_tags.py from BeamNG.Earth, with the sign modules it indexes with)"
         run: |
           B=https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev
-          for f in tools/build_sign_tags.py tools/build_rail_tags.py server/exitsigns.py server/throughsigns.py \
+          for f in tools/npyfirst.py server/npyguard.py tools/build_sign_tags.py tools/build_rail_tags.py server/exitsigns.py server/throughsigns.py \
                    server/milemarkers.py server/routeshields.py server/signshards.py; do
             curl -sfL -o "$(basename "$f")" "$B/$f"
           done
@@ -369,6 +376,9 @@ jobs:
       - name: "The builder (tools/build_station_tags.py from BeamNG.Earth, with build_rail_tags.py it uses)"
         run: |
           B=https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev
+          # (tools/npyfirst.py + server/npyguard.py beside the builder: its "import npyfirst" holds numpy's AVX-512 kernels
+          # back, so a runner on an AVX-512 CPU builds the same bytes as an AVX2 one; without them the import was skipped)
+          for f in tools/npyfirst.py server/npyguard.py; do curl -sfL -o "$(basename "$f")" "https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/$f"; done
           curl -sfL -o build_rail_tags.py "$B/tools/build_rail_tags.py"
           curl -sfL -o build_station_tags.py "$B/tools/build_station_tags.py"
       - name: Build
