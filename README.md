@@ -87,6 +87,17 @@ GeoPackages) with their surveyed width, lane count and surface, built by BeamNG.
 each state's attribution in `deroads/ATTRIBUTION.md`. The data workflow unpacks this repo's release `deroads.tar`, or,
 until there is one, the release on Henner4746's fork whose SHA-256 the workflow pins.
 
+## dedecks/: Germany's measured bridge decks (static, release "dedecks-data"; shards on the tile host only)
+
+`dedecks/<x>/<y>.npz` per zoom-10 tile: height samples on a 1 m grid along every road bridge, from the German states'
+open surface models (DOM, decks included) and terrain models (DGM, decks removed): each sample's position (1e-6
+degrees), its DOM height and, for every 4th sample, its DGM height (cm). Built by BeamNG.Earth's
+`tools/build_de_decks.py` (PR #1531, Henner4746). 14 states (Thuringia is still being built; Saarland publishes no
+open DOM), 677 shards, 645 MB; under dl-de/by-2-0, dl-de/zero-2.0 and CC BY 4.0, with each state's attribution in
+`dedecks/ATTRIBUTION.md`. The data workflow unpacks this repo's release `dedecks.tar`, or, until there is one, the
+release on Henner4746's fork whose SHA-256 the workflow pins. The shards are on the tile host only (the manifest's
+"data"): Pages keeps `dedecks/manifest.json` and `dedecks/ATTRIBUTION.md`, since the site is over 1 GB already.
+
 ## dem/mapterhorn/: Mapterhorn's elevation tiles z0-12 (tile host only, workflow "dem")
 
 [Mapterhorn](https://mapterhorn.com/attribution)'s `planet.pmtiles` (z0-12, terrarium WebP; data from many open
