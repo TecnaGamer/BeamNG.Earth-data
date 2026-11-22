@@ -1,0 +1,367 @@
+# Architecture v2's compact per-cell inputs (CIP; BeamNG.Earth server/cip.py, tools/build_cip.py): one file per z14
+# map cell with every input the world server reads for it (Overture's layers as the server's map data makes them, OSM's
+# road tags joined, the weekly rail / lane shards' slices, the lidar road heights' answers where the US 3DEP covers,
+# OSM fuel / picnic rows) and the OurAirports snapshot, for the whole planet, on the tile host (Cloudflare R2
+# bnge-tiles behind tiles.tgforever.net) under cip<FORMAT>/<Overture release>/<build>/: cells.index.json (the build's
+# inputs, coverage, parts), the parts (PMTiles v3, <= 32 MB each: the CDN caches each whole), airports.csv.gz,
+# runways.csv.gz, ATTRIBUTION.txt; and cip<FORMAT>/<release>/latest.json -> the build players read (written LAST).
+# Players read it with BNE_V2_CIP=on (the default stays off until the user's go; then a cdn.json "cip" key).
+#
+# <build> is the hash of the build's inputs: the code-made part (formats, versions, the Overture release, the map
+# source) and the weekly data builds the cells were made from (OSM road tags, rail, lanes); a server reads a build only
+# when the code-made part is its own, and then reports the build's weekly data builds as its own (no cells of two
+# builds mix in one session).
+#
+# Order of a release (the overture workflow's pipeline, after the BNWT archives): bnwt.yml publishes the release's BNWT
+# archives first (the CIP builder reads Overture through them: BNGE_BNWT_URL, the cell bit for bit as the source gives
+# it, one range read per block instead of DuckDB over 10 MB parquet row groups); then this workflow; then cdn.json.
+#
+# The builder runs ONLY in jobs without secrets, at one pinned commit for the whole run (code_ref: a release tag or a
+# full SHA, never a branch). The jobs holding the R2 secrets run nothing but this repo's tools/cip_ci.py (standard
+# library: every file checked against its record's size and SHA-256) and aws-cli.
+#
+# Resumable like bnwt.yml: each shard (a contiguous Hilbert run of z10 units) writes its own parts and a record
+# (_build/cells/<N>/<I>.json, uploaded after its parts); later runs skip shards with a record; the index and latest.json
+# are written once every shard is done.
+#   code_ref: the BeamNG.Earth tag or commit (blank: the latest release); its build_cip.py must know --world
+#   release:  "latest" (stac.overturemaps.org), "pinned" (the code's overture.RELEASE) or an id
+#   shards:   shards of the planet (keep it the same across the runs of a build)
+#   jobs:     build jobs in this run (<= 250, 20 at once; each up to ~5 h)
+#   lidar:    "measure" (US cells that want the 3DEP lidar: read here, ~30-50 MB of point clouds a cell with bridges)
+#             or "skip" (no lidar sections: players read the lidar themselves, as today)
+#   only:     blank: every shard; else shard numbers "744 3477" (a trial)
+#   dry_run:  build only (artifacts kept 3 days), no upload, no index
+# Scheduled monthly on the 27th (the day after bnwt.yml) with the defaults.
+# Secrets (repo settings): R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.
+name: cip
+
+on:
+  schedule:
+    - cron: "17 5 27 * *"
+  workflow_dispatch:
+    inputs:
+      code_ref:
+        description: "BeamNG.Earth release tag or full commit SHA (blank: the latest release)"
+        default: ""
+      release:
+        description: 'Overture release: "latest", "pinned" (the code''s) or an id like 2026-11-18.0'
+        default: "latest"
+      shards:
+        description: "shards of the planet (the same for every run of a build)"
+        default: "4096"
+      jobs:
+        description: "build jobs in this run (<= 250)"
+        default: "200"
+      lidar:
+        description: '"measure" or "skip"'
+        default: "measure"
+      only:
+        description: 'blank: every shard; else shard numbers "744 3477" (a trial)'
+        default: ""
+      workers:
+        description: "build processes per job (4 vCPUs, 16 GB)"
+        default: "4"
+      dry_run:
+        description: "build only: no upload, no index"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cip
+  cancel-in-progress: false
+
+env:
+  BUCKET: bnge-tiles
+  CODE_REPO: TecnaGamer/BeamNG.Earth
+  CDN: https://tiles.tgforever.net
+
+jobs:
+  prep:
+    # (no secrets: runs the pinned BeamNG.Earth code) the commit, the release, the build id and its inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      sha: ${{ steps.ref.outputs.sha }}
+      skip: ${{ steps.code.outputs.skip }}
+      release: ${{ steps.code.outputs.release }}
+      format: ${{ steps.code.outputs.format }}
+      build: ${{ steps.code.outputs.build }}
+    steps:
+      - id: ref
+        name: "The pinned BeamNG.Earth commit"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ github.event.inputs.code_ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "$REF" ]; then REF=$(gh api "repos/$CODE_REPO/releases/latest" --jq .tag_name); fi
+          [[ "$REF" =~ ^[0-9a-f]{40}$ || "$REF" =~ ^v[0-9][0-9A-Za-z.+-]*$ ]] || { echo "code_ref must be a tag or a full SHA: $REF"; exit 1; }
+          SHA=$(gh api "repos/$CODE_REPO/commits/$REF" --jq .sha)
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "BeamNG.Earth $REF = $SHA" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          repository: ${{ env.CODE_REPO }}
+          ref: ${{ steps.ref.outputs.sha }}
+          path: code
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
+        with:
+          python-version: "3.12"
+      - id: code
+        name: "Its builder, native module, the Overture release and the build's inputs"
+        env:
+          RELEASE: ${{ github.event.inputs.release || 'latest' }}
+          LIDAR: ${{ github.event.inputs.lidar || 'measure' }}
+        run: |
+          set -euo pipefail
+          if ! grep -q -- "--world" code/tools/build_cip.py 2>/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::the pinned commit has no tools/build_cip.py with --world: nothing built"
+            exit 0
+          fi
+          python -m pip install -q -r code/server/requirements.txt
+          (cd code && python tools/build_native.py)
+          cd code/server
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, re, sys, urllib.request
+          sys.path.insert(0, "../tools")
+          import cip, fast, overture
+          fast.require(cip.NATIVE, "cip workflow")
+          r = os.environ["RELEASE"].strip()
+          if r == "latest":
+              r = json.loads(urllib.request.urlopen("https://stac.overturemaps.org/catalog.json", timeout=60).read())["latest"]
+          elif r == "pinned":
+              r = overture.RELEASE
+          if not re.fullmatch(r"\d{4}-\d{2}-\d{2}\.\d+", r):
+              raise SystemExit(f"bad release {r!r}")
+          print("skip=false")
+          print("release=" + r)
+          print("format=" + str(cip.FORMAT))
+          PY
+          R=$(grep '^release=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)
+          # (the BNWT archives of the release must be published: the builder reads Overture through them)
+          for a in base transportation buildings places; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$CDN/bnwt2/$R/$a.c1.index.json")
+            [ "$code" = 200 ] || { echo "::error::BNWT $a of $R not published ($code): run bnwt.yml first"; exit 1; }
+          done
+          # (the build id: the inputs as the pinned code reads them, with the weekly builds of today's manifests)
+          mkdir -p ../../probe
+          BNGE_BNWT_URL=$CDN BNGE_OVERTURE_RELEASE=$R python ../tools/build_cip.py --cache ../../probe --out ../../probe/out \
+            --online --lidar "${LIDAR:-measure}" --inputs-only > ../../probe/inputs.json
+          B=$(python3 -c 'import json; print(json.load(open("../../probe/inputs.json"))["build"])')
+          python3 -m json.tool ../../probe/inputs.json >> "$GITHUB_STEP_SUMMARY"
+          [[ "$B" =~ ^[0-9a-f]{16}$ ]]
+          echo "build=$B" >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT" | tee -a "$GITHUB_STEP_SUMMARY"
+      - if: steps.code.outputs.skip != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: earthfast
+          path: code/server/earthfast.abi3.so
+          retention-days: 7
+          if-no-files-found: error
+
+  listing:
+    # (secrets: aws-cli only) what is in the bucket for this build already
+    needs: prep
+    if: ${{ needs.prep.outputs.skip != 'true' && github.event.inputs.dry_run != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: The build's keys in the bucket
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          PREFIX: cip${{ needs.prep.outputs.format }}/${{ needs.prep.outputs.release }}/${{ needs.prep.outputs.build }}/
+        run: |
+          set -euo pipefail
+          aws s3 ls "s3://$BUCKET/$PREFIX" --recursive --endpoint-url "$R2" > listing.txt || true
+          echo "$(wc -l < listing.txt) keys under $PREFIX"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: listing
+          path: listing.txt
+          retention-days: 7
+
+  plan:
+    needs: [prep, listing]
+    if: ${{ !cancelled() && needs.prep.outputs.skip != 'true' && needs.prep.result == 'success' && needs.listing.result != 'failure' }}
+    runs-on: ubuntu-latest
+    outputs:
+      entries: ${{ steps.plan.outputs.entries }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - if: ${{ needs.listing.result == 'success' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: listing
+      - id: plan
+        env:
+          RELEASE: ${{ needs.prep.outputs.release }}
+          FORMAT: ${{ needs.prep.outputs.format }}
+          BUILD: ${{ needs.prep.outputs.build }}
+          SHARDS: ${{ github.event.inputs.shards || '4096' }}
+          JOBS: ${{ github.event.inputs.jobs || '200' }}
+          ONLY: ${{ github.event.inputs.only }}
+        run: |
+          set -euo pipefail
+          [[ "$SHARDS" =~ ^[0-9]+$ && "$JOBS" =~ ^[0-9]+$ && "$ONLY" =~ ^[0-9\ ]*$ ]]
+          L=(); [ -f listing.txt ] && L=(--listing listing.txt)
+          python3 tools/cip_ci.py plan --release "$RELEASE" --format "$FORMAT" --build "$BUILD" --shards "$SHARDS" \
+            --jobs "$JOBS" --only "$ONLY" "${L[@]}" 2> plan.log > plan.json
+          cat plan.log | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 -c 'import json; print("entries=" + json.dumps(json.load(open("plan.json"))["entries"], separators=(",", ":")))' >> "$GITHUB_OUTPUT"
+
+  shards:
+    needs: [prep, plan]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.entries != '[]' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        entry: ${{ fromJson(needs.plan.outputs.entries) }}
+    permissions:
+      contents: read
+      actions: write
+    uses: ./.github/workflows/cip-shards.yml
+    with:
+      id: ${{ matrix.entry.id }}
+      shards: ${{ matrix.entry.shards }}
+      of: ${{ github.event.inputs.shards || '4096' }}
+      sha: ${{ needs.prep.outputs.sha }}
+      release: ${{ needs.prep.outputs.release }}
+      format: ${{ needs.prep.outputs.format }}
+      build: ${{ needs.prep.outputs.build }}
+      lidar: ${{ github.event.inputs.lidar || 'measure' }}
+      workers: ${{ github.event.inputs.workers || '4' }}
+      dry_run: ${{ github.event.inputs.dry_run == 'true' }}
+    secrets:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+  records:
+    # (secrets: aws-cli only) every shard record of the build, for its index
+    needs: [prep, shards]
+    if: ${{ !cancelled() && needs.prep.outputs.skip != 'true' && needs.prep.result == 'success' && github.event.inputs.dry_run != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: The records and the build's listing
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          PREFIX: cip${{ needs.prep.outputs.format }}/${{ needs.prep.outputs.release }}/${{ needs.prep.outputs.build }}
+          SHARDS: ${{ github.event.inputs.shards || '4096' }}
+        run: |
+          set -euo pipefail
+          aws configure set default.s3.max_concurrent_requests 32
+          aws s3 sync "s3://$BUCKET/$PREFIX/_build/cells/$SHARDS/" "rec/$PREFIX/_build/cells/$SHARDS/" --endpoint-url "$R2" --only-show-errors
+          echo "$(ls "rec/$PREFIX/_build/cells/$SHARDS" 2>/dev/null | wc -l) of $SHARDS shards done" | tee -a "$GITHUB_STEP_SUMMARY"
+          aws s3 ls "s3://$BUCKET/$PREFIX/" --recursive --endpoint-url "$R2" > rec/listing.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: records
+          path: rec
+          retention-days: 7
+
+  assemble:
+    # (no secrets: the pinned code writes the index, the airports snapshot and latest.json from the records)
+    needs: [prep, records]
+    if: ${{ !cancelled() && needs.records.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          repository: ${{ env.CODE_REPO }}
+          ref: ${{ needs.prep.outputs.sha }}
+          path: code
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: earthfast
+          path: code/server
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: records
+          path: rec
+      - name: Index, airports and attribution once every shard is done
+        env:
+          RELEASE: ${{ needs.prep.outputs.release }}
+          FORMAT: ${{ needs.prep.outputs.format }}
+          BUILD: ${{ needs.prep.outputs.build }}
+          SHARDS: ${{ github.event.inputs.shards || '4096' }}
+          LIDAR: ${{ github.event.inputs.lidar || 'measure' }}
+        run: |
+          set -euo pipefail
+          python -m pip install -q -r code/server/requirements.txt
+          D="rec/cip$FORMAT/$RELEASE/$BUILD"
+          mkdir -p pub
+          got=$(ls "$D/_build/cells/$SHARDS" 2>/dev/null | wc -l)
+          if [ "$got" -ne "$SHARDS" ]; then echo "$got of $SHARDS shards: no index yet" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; fi
+          if grep -q " cip$FORMAT/$RELEASE/$BUILD/cells.index.json$" rec/listing.txt; then echo "published already"; exit 0; fi
+          BNGE_BNWT_URL=$CDN BNGE_OVERTURE_RELEASE=$RELEASE python code/tools/build_cip.py --cache cache --out rec \
+            --world --online --lidar "$LIDAR" --work work --assemble --from-shards "$SHARDS" | tee -a "$GITHUB_STEP_SUMMARY"
+          cp "$D/cells.index.json" "$D/ATTRIBUTION.txt" "$D"/airports.csv.gz "$D"/runways.csv.gz pub/
+          cp "rec/cip$FORMAT/$RELEASE/latest.json" pub/
+          cp rec/listing.txt .
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: indexes
+          path: |
+            pub
+            listing.txt
+          retention-days: 7
+
+  publish:
+    # (secrets: this repo's checker and aws-cli only) the index once every part is in the bucket, latest.json LAST
+    needs: [prep, assemble]
+    if: ${{ !cancelled() && needs.assemble.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: indexes
+          path: in
+      - name: Check and publish
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          RELEASE: ${{ needs.prep.outputs.release }}
+          FORMAT: ${{ needs.prep.outputs.format }}
+          BUILD: ${{ needs.prep.outputs.build }}
+        run: |
+          set -euo pipefail
+          if [ ! -f in/pub/cells.index.json ]; then echo "the build is not complete in this run"; exit 0; fi
+          python3 tools/cip_ci.py published in/pub --release "$RELEASE" --format "$FORMAT" --build "$BUILD" \
+            --listing in/listing.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          P="s3://$BUCKET/cip$FORMAT/$RELEASE"
+          CP=(--endpoint-url "$R2" --only-show-errors)
+          aws s3 cp in/pub/ATTRIBUTION.txt "$P/$BUILD/ATTRIBUTION.txt" "${CP[@]}" --content-type "text/plain; charset=utf-8"
+          for f in airports.csv.gz runways.csv.gz; do
+            aws s3 cp "in/pub/$f" "$P/$BUILD/$f" "${CP[@]}" --content-type application/octet-stream \
+              --cache-control "public, max-age=31536000, immutable"
+          done
+          aws s3 cp in/pub/cells.index.json "$P/$BUILD/cells.index.json" "${CP[@]}" --content-type application/json \
+            --cache-control "public, max-age=31536000, immutable"
+          # (last: what players read first; the old build stays for the sessions pinned to it)
+          aws s3 cp in/pub/latest.json "$P/latest.json" "${CP[@]}" --content-type application/json --cache-control "no-cache"
+          echo "published: cip$FORMAT/$RELEASE/$BUILD" | tee -a "$GITHUB_STEP_SUMMARY"
