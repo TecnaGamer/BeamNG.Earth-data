@@ -303,6 +303,12 @@ def compare_counts(names, old, new, max_drop=MAX_DROP_PCT, max_grow=MAX_GROW_PCT
         if po.get("cells") != pn.get("cells"):
             problems.append(f"{name}: counted on other cells")
         for layer in sorted(set(po.get("layers", {})) | set(pn.get("layers", {}))):
+            if layer not in po.get("layers", {}) or layer not in pn.get("layers", {}):
+                # (a layer only one side counts: the app tree added it, e.g. the natural features' land and
+                # bathymetry; no baseline to bound it by yet)
+                lines.append(f"| {name} | {layer} | {po['layers'].get(layer, '-')} | {pn['layers'].get(layer, '-')} | "
+                             f"new |")
+                continue
             a, b = int(po["layers"].get(layer, 0)), int(pn["layers"].get(layer, 0))
             pct = (b - a) / a * 100.0 if a else (0.0 if b == 0 else math.inf)
             bad = abs(b - a) > slack and (pct < -max_drop or pct > max_grow)

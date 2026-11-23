@@ -236,5 +236,14 @@ class CorpusTest(unittest.TestCase):
             self.assertTrue(any('planned on Overture 2026-12-16.0' in p for p in problems))
 
 
+
+class NewLayerTest(unittest.TestCase):
+    def test_a_layer_without_a_baseline_is_listed_not_bounded(self):
+        old = {"places": {"p": {"cells": ["14/1/1"], "layers": {"roads": 100}}}}
+        new = {"places": {"p": {"cells": ["14/1/1"], "layers": {"roads": 100, "land": 5000}}}}
+        lines, problems = ci.compare_counts(["p"], old, new)
+        self.assertEqual(problems, [])
+        self.assertTrue(any("land" in ln and "new" in ln for ln in lines))
+
 if __name__ == '__main__':
     unittest.main()

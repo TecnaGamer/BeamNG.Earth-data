@@ -27,6 +27,14 @@ import time
 
 RELEASE_RE = re.compile(r"20[2-9]\d-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\.\d{1,2}")
 LAYERS = ("roads", "connectors", "buildings", "building_parts", "places", "water", "land_use", "infrastructure")
+# BeamNG.Earth's natural features (its natural.py, BNE_NATURAL_*: Overture base/land and base/bathymetry; CIP sections
+# m:land / m:bathymetry): counted too where the pinned app tree has them (an older tree does not: counted as before)
+NATURAL_LAYERS = ("land", "bathymetry")
+
+
+def _layers():
+    import mapdata
+    return LAYERS + tuple(ly for ly in NATURAL_LAYERS if ly in getattr(mapdata, "ALL_LAYERS", ()))
 # blockworker.init's parameters as tools/build_decisions.py's _worker passes them (gate-info): a tree whose init takes
 # others stops the gate (the vkey would not be the builder's) until this script follows it
 INIT_PARAMS = ("cache_dir", "offline", "roads", "grading", "road_widths", "surface", "warm_q", "log_level", "airports",
@@ -89,15 +97,16 @@ def cmd_counts(a):
         for c in idx.get("cells", ()):
             z, x, y = (int(v) for v in str(c).split("/"))
             cells |= {(z, x + dx, y + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)}
-        r = {"cells": [f"{z}/{x}/{y}" for z, x, y in sorted(cells)], "layers": {k: 0 for k in LAYERS}, "errors": []}
+        layers = _layers()
+        r = {"cells": [f"{z}/{x}/{y}" for z, x, y in sorted(cells)], "layers": {k: 0 for k in layers}, "errors": []}
         t0 = time.time()
         for z, x, y in sorted(cells):
             try:
-                cd = md.cell(mapcells.CellKey(z, x, y), layers=LAYERS, kind="demand")
+                cd = md.cell(mapcells.CellKey(z, x, y), layers=layers, kind="demand")
             except Exception as e:      # (reported: the check fails on any)
                 r["errors"].append(f"{z}/{x}/{y}: {type(e).__name__}: {e}")
                 continue
-            for name in LAYERS:
+            for name in layers:
                 f = cd.layers.get(name)
                 if f is None or not len(f):
                     continue
