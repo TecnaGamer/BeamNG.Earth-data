@@ -300,6 +300,8 @@ jobs:
     if: ${{ !cancelled() && needs.records.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    outputs:
+      ready: ${{ steps.index.outputs.ready }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
         with:
@@ -319,6 +321,7 @@ jobs:
           name: records
           path: rec
       - name: Index, airports and attribution once every shard is done
+        id: index
         env:
           RELEASE: ${{ needs.prep.outputs.release }}
           FORMAT: ${{ needs.prep.outputs.format }}
@@ -335,6 +338,7 @@ jobs:
           got=$(ls "$D/_build/cells/$SHARDS" 2>/dev/null | wc -l)
           if [ "$got" -ne "$SHARDS" ]; then echo "$got of $SHARDS shards: no index yet" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; fi
           if grep -q " cip$FORMAT/$RELEASE/$BUILD/cells.index.json$" rec/listing.txt; then echo "published already"; exit 0; fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
           BNGE_BNWT_URL=$CDN BNGE_OVERTURE_RELEASE=$RELEASE python code/tools/build_cip.py --cache cache --out rec \
             --world --scope "$SCOPE" --online --lidar "$LIDAR" --work work --assemble --from-shards "$SHARDS" --expect-build "$BUILD" \
             | tee -a "$GITHUB_STEP_SUMMARY"
@@ -352,7 +356,8 @@ jobs:
   publish:
     # (secrets: this repo's checker and aws-cli only) the index once every part is in the bucket, latest.json LAST
     needs: [prep, assemble]
-    if: ${{ !cancelled() && needs.assemble.result == 'success' }}
+    # (only once the assemble step wrote the index: a partial run, or one already published, has nothing to publish)
+    if: ${{ !cancelled() && needs.assemble.result == 'success' && needs.assemble.outputs.ready == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
