@@ -1,0 +1,9 @@
+{
+  "v1": {
+    "tag": "cliff-4k-v1",
+    "asset": "cliff-4k-v1-handoff.zip",
+    "zip_sha256": "dc608142b3389273f31d8c3a0b04005124472b0da2a3f33cf38db65b29cfdaea",
+    "manifest_sha256": "0e0d8176d00f46bb45d64f4cc51478b35109cf7af63390b8cd4abf2ce1a6e7c9",
+    "note": "PR #1412 (Austint30), handoff verified 2026-11-23: 27 WebPs, 303,365,188 bytes; user's go 2026-11-23"
+  }
+}

@@ -1,0 +1,187 @@
+# BeamNG.Earth's optional 4K cliff texture pack (PR #1412, clifftextures.py; the user's go on hosting and publishing,
+# 2026-11-23) on the tile host (Cloudflare R2 bnge-tiles behind tiles.tgforever.net):
+#   cliff/4k/<version>/<set>/<name>.webp   the 27 allowlisted textures (immutable)
+#   cliff/4k/<version>/ATTRIBUTION.md      the contributor's notices bundled (not in the manifest: players ignore it)
+#   cliff/4k/<version>/manifest.json       {"format": 1, "files": [{"path", "size", "sha256"}]}, generated here, LAST
+# Players read it only after cdn.json {"cliffs": {"enabled": true, "base": ".../cliff/4k/<version>/"}} (a hand commit
+# after this workflow's live check; README-cliffpack.md). Old versions stay: nothing here deletes or overwrites a
+# published version (a version whose manifest.json is in the bucket is only compared, never written again).
+#
+#   check    [no secrets] the handoff zip from this repo's release (tag cliff-4k-<version>), its SHA-256 against
+#            tools/cliffpack_pins.json (and the sha256 input when given), unpacked by tools/cliffpack_ci.py (Python
+#            zipfile: allowlisted names only, no symlinks / traversal / duplicates), checked and staged (every WebP's
+#            container, sizes, the 27 names, the notices, the handoff's own inventory/manifest agreeing), the generated
+#            manifest's SHA-256 against the pin; the staged folder as an artifact. Nothing in the zip is executed.
+#   publish  [R2 secrets: this repo's stdlib checker and aws-cli only] the artifact checked again (recheck: pinned
+#            manifest), the version's keys listed (refuses strays; published already: compare, never rewrite), the
+#            WebPs and ATTRIBUTION.md uploaded, the listing checked for every size, manifest.json last.
+#   live     [no secrets] manifest.json and every file fetched through the CDN, byte-compared with the artifact.
+# Inputs: version (v1, v2, ...: must be pinned in tools/cliffpack_pins.json first), tag (blank: cliff-4k-<version>),
+# sha256 (optional: must equal the pin), dry_run (check only).
+# Secrets (repo settings): R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.
+name: cliffpack
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "pack version: v1, v2, ... (pinned in tools/cliffpack_pins.json)"
+        default: "v1"
+      tag:
+        description: "release tag holding the handoff zip (blank: cliff-4k-<version>)"
+        default: ""
+      sha256:
+        description: "optional: the zip's SHA-256 (must equal the pin)"
+        default: ""
+      dry_run:
+        description: "check and stage only: no upload"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cliffpack
+  cancel-in-progress: false
+
+env:
+  BUCKET: bnge-tiles
+  CDN: https://tiles.tgforever.net
+
+jobs:
+  check:
+    # (no secrets) the pinned zip unpacked and checked by this repo's stdlib checker; the staged pack as an artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.dl.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - id: dl
+        name: "The release's zip, its pinned SHA-256, unpacked, checked and staged"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.event.inputs.version }}
+          TAG: ${{ github.event.inputs.tag }}
+          SHA_IN: ${{ github.event.inputs.sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^v[1-9][0-9]{0,3}$ ]] || { echo "::error::bad version: $VERSION"; exit 1; }
+          TAG=${TAG:-cliff-4k-$VERSION}
+          [[ "$TAG" =~ ^cliff-4k-[A-Za-z0-9.-]{1,40}$ ]] || { echo "::error::bad tag: $TAG"; exit 1; }
+          read -r ASSET PIN < <(python3 -I tools/cliffpack_ci.py pin --pins tools/cliffpack_pins.json --version "$VERSION")
+          [[ "$ASSET" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ && "$PIN" =~ ^[0-9a-f]{64}$ ]]
+          if [ -n "$SHA_IN" ] && [ "${SHA_IN,,}" != "$PIN" ]; then
+            echo "::error::the sha256 input $SHA_IN is not the pinned $PIN"; exit 1
+          fi
+          mkdir zip
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "$ASSET" -D zip
+          [ "$(ls zip)" = "$ASSET" ] || { echo "::error::the release gave other files: $(ls zip)"; exit 1; }
+          echo "$PIN  zip/$ASSET" | sha256sum -c -
+          # (zip/, unpacked/ and stage/ are outside tools/; python -I: nothing imported from the working folders)
+          python3 -I tools/cliffpack_ci.py unzip "zip/$ASSET" unpacked --sha256 "$PIN" | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 -I tools/cliffpack_ci.py check unpacked stage --version "$VERSION" --pins tools/cliffpack_pins.json \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          # (no --pins here: a dry run of a new version with only its zip pinned prints the manifest SHA-256 to pin;
+          # the publish job's recheck requires the pinned manifest_sha256)
+          python3 -I tools/cliffpack_ci.py recheck stage --version "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: cliffpack-${{ steps.dl.outputs.version }}
+          path: stage
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    # (secrets: this repo's checker and aws-cli only) WebPs and ATTRIBUTION.md, every size checked, manifest.json LAST
+    needs: check
+    if: ${{ github.event.inputs.dry_run != 'true' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: cliffpack-${{ needs.check.outputs.version }}
+          path: stage
+      - name: Check again and upload (never deletes, never rewrites a published version)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^v[1-9][0-9]{0,3}$ ]]
+          python3 -I tools/cliffpack_ci.py recheck stage --version "$VERSION" --pins tools/cliffpack_pins.json \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          KEY="cliff/4k/$VERSION"
+          P="s3://$BUCKET/$KEY"
+          CP=(--endpoint-url "$R2" --only-show-errors)
+          # (list-objects-v2 exits 0 on an empty prefix and non-zero on an auth / network error: no silent "not there")
+          aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$KEY/" --endpoint-url "$R2" --output json > before.json
+          python3 -I tools/cliffpack_ci.py remote stage --version "$VERSION" --listing before.json | tee state.txt
+          if grep -qx 'state=published' state.txt; then
+            aws s3 cp "$P/manifest.json" live-manifest.json "${CP[@]}"
+            if cmp -s live-manifest.json stage/manifest.json; then
+              echo "$KEY: published already with this manifest; nothing uploaded" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "::error::$KEY/manifest.json is in the bucket with other content: a published version is never changed; pin and publish a new version"
+            exit 1
+          fi
+          IMM=(--cache-control "public, max-age=31536000, immutable")
+          # (the names come from the checker's allowlist, never from a listing of the artifact)
+          python3 -I tools/cliffpack_ci.py names > names.txt
+          [ "$(wc -l < names.txt)" -eq 27 ]
+          while read -r n; do
+            [[ "$n" =~ ^(natural|limestone|arid|canyon|shared)/[a-z0-9_]+\.[a-z]+\.webp$ ]]
+            aws s3 cp "stage/$n" "$P/$n" "${CP[@]}" --content-type image/webp "${IMM[@]}"
+          done < names.txt
+          aws s3 cp stage/ATTRIBUTION.md "$P/ATTRIBUTION.md" "${CP[@]}" \
+            --content-type "text/markdown; charset=utf-8" --cache-control "public, max-age=86400"
+          aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$KEY/" --endpoint-url "$R2" --output json > after.json
+          python3 -I tools/cliffpack_ci.py remote stage --version "$VERSION" --listing after.json --complete \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          # (last: what players read first)
+          aws s3 cp stage/manifest.json "$P/manifest.json" "${CP[@]}" \
+            --content-type application/json --cache-control "public, max-age=86400"
+          echo "published: $KEY ($(python3 -c 'import hashlib; print(hashlib.sha256(open("stage/manifest.json","rb").read()).hexdigest())'))" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+  live:
+    # (no secrets) what players will read, through the CDN, against the artifact
+    needs: [check, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: cliffpack-${{ needs.check.outputs.version }}
+          path: stage
+      - name: Every file through the CDN, and the cdn.json command
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^v[1-9][0-9]{0,3}$ ]]
+          python3 -I tools/cliffpack_ci.py live stage --base "$CDN/cliff/4k/$VERSION/" | tee -a "$GITHUB_STEP_SUMMARY"
+          {
+            echo
+            echo "Live. To turn it on for players (by hand, last; README-cliffpack.md):"
+            echo '```'
+            echo "python3 tools/cliffpack_ci.py cdn-key cdn.json --base $CDN/cliff/4k/$VERSION/"
+            echo "git commit -m 'cdn.json: the 4K cliff pack $VERSION (cliffs on)' -- cdn.json && git push"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
