@@ -26,9 +26,14 @@
 #   code_ref: the BeamNG.Earth tag or commit (blank: the latest release); its build_cip.py must know --world
 #   release:  "latest" (stac.overturemaps.org), "pinned" (the code's overture.RELEASE) or an id
 #   shards:   shards of the planet (keep it the same across the runs of a build)
-#   jobs:     build jobs in this run (<= 250, 20 at once; each up to ~5 h)
+#   jobs:     build jobs in this run (<= 250, 20 at once; each up to ~5 h). A release (2026-11-18.0, measured on a PC,
+#             build_cip at claude-cipfix): scope "content" ~430 GB (+-65) in ~14-20 M cells, ~375 CPU-h (+-45; ~8-10 h of
+#             20 runners, two runs); "all" ~520 GB, ~2,250 CPU-h (the open sea's and empty land's cells: ~7-8 runs)
 #   lidar:    "measure" (US cells that want the 3DEP lidar: read here, ~30-50 MB of point clouds a cell with bridges)
 #             or "skip" (no lidar sections: players read the lidar themselves, as today)
+#   scope:    the cells built (build_cip.py SCOPES): "content" (a BNWT tile of roads, buildings or places), "roads", or
+#             "all" (the open sea and empty land too: ~229 M of the 268 M cells, most of the build's CPU); a cell left
+#             out is read from its sources by the players, as without CIP
 #   only:     blank: every shard; else shard numbers "744 3477" (a trial)
 #   dry_run:  build only (artifacts kept 3 days), no upload, no index
 # Scheduled monthly on the 27th (the day after bnwt.yml) with the defaults.
@@ -55,6 +60,9 @@ on:
       lidar:
         description: '"measure" or "skip"'
         default: "measure"
+      scope:
+        description: '"content" (cells with roads, buildings or places: ~16-20 M), "roads" or "all" (every cell, the sea too)'
+        default: "content"
       only:
         description: 'blank: every shard; else shard numbers "744 3477" (a trial)'
         default: ""
@@ -117,12 +125,19 @@ jobs:
         env:
           RELEASE: ${{ github.event.inputs.release || 'latest' }}
           LIDAR: ${{ github.event.inputs.lidar || 'measure' }}
+          SCOPE: ${{ github.event.inputs.scope || 'content' }}
         run: |
           set -euo pipefail
+          [[ "$SCOPE" =~ ^(all|content|roads)$ ]] || { echo "bad scope $SCOPE"; exit 1; }
           if ! grep -q -- "--world" code/tools/build_cip.py 2>/dev/null; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "::notice::the pinned commit has no tools/build_cip.py with --world: nothing built"
             exit 0
+          fi
+          # (a builder before --expect-build / --scope hashed another build id than its shards' output, trial 45072641879)
+          if ! grep -q -- '"--expect-build"' code/tools/build_cip.py || ! grep -q -- '"--scope"' code/tools/build_cip.py; then
+            echo "::error::the pinned commit's tools/build_cip.py has no --expect-build / --scope: pin a later commit"
+            exit 1
           fi
           python -m pip install -q -r code/server/requirements.txt
           (cd code && python tools/build_native.py)
@@ -149,10 +164,12 @@ jobs:
             code=$(curl -s -o /dev/null -w "%{http_code}" "$CDN/bnwt2/$R/$a.c1.index.json")
             [ "$code" = 200 ] || { echo "::error::BNWT $a of $R not published ($code): run bnwt.yml first"; exit 1; }
           done
-          # (the build id: the inputs as the pinned code reads them, with the weekly builds of today's manifests)
+          # (the build id: the inputs as the pinned code reads them, with the weekly builds of today's manifests; --world:
+          # the planet build's layers, as the shards' --world builds hash them; without it the id was another build's and
+          # every shard's output landed under a folder the artifact step did not look in, trial 45072641879)
           mkdir -p ../../probe
           BNGE_BNWT_URL=$CDN BNGE_OVERTURE_RELEASE=$R python ../tools/build_cip.py --cache ../../probe --out ../../probe/out \
-            --online --lidar "${LIDAR:-measure}" --inputs-only > ../../probe/inputs.json
+            --world --scope "$SCOPE" --online --lidar "${LIDAR:-measure}" --inputs-only > ../../probe/inputs.json
           B=$(python3 -c 'import json; print(json.load(open("../../probe/inputs.json"))["build"])')
           python3 -m json.tool ../../probe/inputs.json >> "$GITHUB_STEP_SUMMARY"
           [[ "$B" =~ ^[0-9a-f]{16}$ ]]
@@ -241,6 +258,7 @@ jobs:
       format: ${{ needs.prep.outputs.format }}
       build: ${{ needs.prep.outputs.build }}
       lidar: ${{ github.event.inputs.lidar || 'measure' }}
+      scope: ${{ github.event.inputs.scope || 'content' }}
       workers: ${{ github.event.inputs.workers || '4' }}
       dry_run: ${{ github.event.inputs.dry_run == 'true' }}
     secrets:
@@ -265,9 +283,11 @@ jobs:
         run: |
           set -euo pipefail
           aws configure set default.s3.max_concurrent_requests 32
+          mkdir -p "rec/$PREFIX/_build/cells/$SHARDS"
           aws s3 sync "s3://$BUCKET/$PREFIX/_build/cells/$SHARDS/" "rec/$PREFIX/_build/cells/$SHARDS/" --endpoint-url "$R2" --only-show-errors
           echo "$(ls "rec/$PREFIX/_build/cells/$SHARDS" 2>/dev/null | wc -l) of $SHARDS shards done" | tee -a "$GITHUB_STEP_SUMMARY"
-          aws s3 ls "s3://$BUCKET/$PREFIX/" --recursive --endpoint-url "$R2" > rec/listing.txt
+          # (aws s3 ls exits 1 on an empty prefix: no shard uploaded yet is not an error; the assemble job counts them)
+          aws s3 ls "s3://$BUCKET/$PREFIX/" --recursive --endpoint-url "$R2" > rec/listing.txt || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
         with:
           name: records
@@ -305,8 +325,10 @@ jobs:
           BUILD: ${{ needs.prep.outputs.build }}
           SHARDS: ${{ github.event.inputs.shards || '4096' }}
           LIDAR: ${{ github.event.inputs.lidar || 'measure' }}
+          SCOPE: ${{ github.event.inputs.scope || 'content' }}
         run: |
           set -euo pipefail
+          [[ "$SCOPE" =~ ^(all|content|roads)$ ]]
           python -m pip install -q -r code/server/requirements.txt
           D="rec/cip$FORMAT/$RELEASE/$BUILD"
           mkdir -p pub
@@ -314,7 +336,8 @@ jobs:
           if [ "$got" -ne "$SHARDS" ]; then echo "$got of $SHARDS shards: no index yet" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; fi
           if grep -q " cip$FORMAT/$RELEASE/$BUILD/cells.index.json$" rec/listing.txt; then echo "published already"; exit 0; fi
           BNGE_BNWT_URL=$CDN BNGE_OVERTURE_RELEASE=$RELEASE python code/tools/build_cip.py --cache cache --out rec \
-            --world --online --lidar "$LIDAR" --work work --assemble --from-shards "$SHARDS" | tee -a "$GITHUB_STEP_SUMMARY"
+            --world --scope "$SCOPE" --online --lidar "$LIDAR" --work work --assemble --from-shards "$SHARDS" --expect-build "$BUILD" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
           cp "$D/cells.index.json" "$D/ATTRIBUTION.txt" "$D"/airports.csv.gz "$D"/runways.csv.gz pub/
           cp "rec/cip$FORMAT/$RELEASE/latest.json" pub/
           cp rec/listing.txt .

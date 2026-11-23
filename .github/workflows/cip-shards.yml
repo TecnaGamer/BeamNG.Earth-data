@@ -21,6 +21,7 @@ on:
       format: {type: string, required: true}
       build: {type: string, required: true}
       lidar: {type: string, default: "measure"}
+      scope: {type: string, default: "all"}
       workers: {type: string, default: "4"}
       dry_run: {type: boolean, default: false}
     secrets:
@@ -45,10 +46,11 @@ jobs:
           RELEASE: ${{ inputs.release }}
           BUILD: ${{ inputs.build }}
           LIDAR: ${{ inputs.lidar }}
+          SCOPE: ${{ inputs.scope }}
           WORKERS: ${{ inputs.workers }}
         run: |
           [[ "$SHARDS" =~ ^[0-9\ ]+$ && "$OF" =~ ^[0-9]+$ && "$SHA" =~ ^[0-9a-f]{40}$ && "$BUILD" =~ ^[0-9a-f]{16}$ \
-             && "$RELEASE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\.[0-9]+$ && "$WORKERS" =~ ^[1-8]$ && "$LIDAR" =~ ^(measure|skip)$ ]]
+             && "$RELEASE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\.[0-9]+$ && "$WORKERS" =~ ^[1-8]$ && "$LIDAR" =~ ^(measure|skip)$ && "$SCOPE" =~ ^(all|content|roads)$ ]]
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
         with:
           repository: TecnaGamer/BeamNG.Earth
@@ -79,7 +81,9 @@ jobs:
           RELEASE: ${{ inputs.release }}
           BUILD: ${{ inputs.build }}
           LIDAR: ${{ inputs.lidar }}
+          SCOPE: ${{ inputs.scope }}
           WORKERS: ${{ inputs.workers }}
+          FORMAT: ${{ inputs.format }}
           BNGE_BNWT_URL: https://tiles.tgforever.net
           BNGE_OVERTURE_RELEASE: ${{ inputs.release }}
         run: |
@@ -94,19 +98,27 @@ jobs:
           for i in $SHARDS; do
             if [ "$(date +%s)" -gt "$DEADLINE" ]; then left=$((left + 1)); continue; fi
             t0=$(date +%s)
-            got=$(python code/tools/build_cip.py --cache "$D/cache" --out "$D/out" --online --lidar "$LIDAR" --inputs-only | \
-                  python3 -c 'import json, sys; print(json.load(sys.stdin)["build"])')
-            if [ "$got" != "$BUILD" ]; then
-              failed=$((failed + 1)); echo "::warning::shard $i/$OF: the inputs are build $got now, not $BUILD (a weekly build landed)"
-            elif python code/tools/build_cip.py --cache "$D/cache" --out "$D/out" --work "$D/work" --online --world \
-                 --lidar "$LIDAR" --jobs "$WORKERS" --shard "$i/$OF" --shard-parts; then
+            # (one run: the builder computes the build id from its own inputs (the --world layers) and refuses with
+            # exit 3 when it is not $BUILD (a weekly data build landed since the plan); its output then lands exactly
+            # under $D/out/cip$FORMAT/$RELEASE/$BUILD/, the artifact's path)
+            rc=0
+            python code/tools/build_cip.py --cache "$D/cache" --out "$D/out" --work "$D/work" --online --world \
+              --scope "$SCOPE" --lidar "$LIDAR" --jobs "$WORKERS" --shard "$i/$OF" --shard-parts --expect-build "$BUILD" \
+              > "$D/shard.json" || rc=$?
+            cat "$D/shard.json" || true
+            if [ "$rc" -eq 0 ]; then
               ok=$((ok + 1))
+            elif [ "$rc" -eq 3 ]; then
+              failed=$((failed + 1)); echo "::warning::shard $i/$OF: the inputs are another build now, not $BUILD (a weekly build landed)"
             else
-              failed=$((failed + 1)); echo "::warning::shard $i/$OF failed"
+              failed=$((failed + 1)); echo "::warning::shard $i/$OF failed ($rc)"
             fi
+            echo "shard $i: $(( $(date +%s) - t0 )) s, cache $(du -sm "$D/cache" 2>/dev/null | cut -f1) MB, work $(du -sm "$D/work" 2>/dev/null | cut -f1) MB, output $(du -sm "$D/out" 2>/dev/null | cut -f1) MB"
             rm -rf "$D/work" "$D/cache"
-            echo "shard $i: $(( $(date +%s) - t0 )) s, output $(du -sm "$D/out" 2>/dev/null | cut -f1) MB"
           done
+          # (the artifact is exactly the build's folder: another folder there is another build id's output, never uploaded)
+          stray=$(find "$D/out" -mindepth 3 -maxdepth 3 -type d ! -path "*/cip$FORMAT/$RELEASE/$BUILD" 2>/dev/null | head -5)
+          if [ -n "$stray" ]; then echo "::error::output of another build than $BUILD: $stray"; failed=$((failed + 1)); fi
           echo "cells: $ok shards built, $failed failed, $left left for the next run" | tee -a "$GITHUB_STEP_SUMMARY"
           echo "FAILED=$failed" >> "$GITHUB_ENV"
       - id: art
