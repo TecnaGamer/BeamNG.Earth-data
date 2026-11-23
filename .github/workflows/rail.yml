@@ -11,10 +11,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-  actions: read   # (deploy: an optional job that failed keeps its last good artifact)
-  pages: write
-  id-token: write
+  contents: read   # (every job; site and deploy add theirs: the build jobs, which run pip's packages and code fetched
+                   # from BeamNG.Earth, get a read-only token)
 
 concurrency:
   group: pages
@@ -40,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 340
     steps:
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
         with:
           python-version: "3.12"
       - name: Tools
@@ -60,7 +58,7 @@ jobs:
         run: |
           python build_rail_tags.py "${{ needs.planet.outputs.url }}" out/rail
           echo "${{ needs.planet.outputs.url }}" > out/rail/planet.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
         with:
           name: rail
           path: out
@@ -71,7 +69,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 340
     steps:
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
         with:
           python-version: "3.12"
       - name: Tools
@@ -87,7 +85,7 @@ jobs:
         run: |
           python build_lane_tags.py "${{ needs.planet.outputs.url }}" out/lanes
           echo "${{ needs.planet.outputs.url }}" > out/lanes/planet.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
         with:
           name: lanes
           path: out
@@ -98,7 +96,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 340
     steps:
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
         with:
           python-version: "3.12"
       - name: Tools
@@ -119,7 +117,7 @@ jobs:
         run: |
           python build_sign_tags.py "${{ needs.planet.outputs.url }}" out/signs
           echo "${{ needs.planet.outputs.url }}" > out/signs/planet.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
         with:
           name: signs
           path: out
@@ -132,8 +130,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 340
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
         with:
           python-version: "3.12"
       - name: Tools
@@ -142,7 +142,7 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Build
         run: python tools/build_route_relation_index.py "${{ needs.planet.outputs.url }}" out/routes
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
         with:
           name: routes
           path: out
@@ -151,16 +151,19 @@ jobs:
   osmtags:
     # OpenStreetMap's road tags (lanes, width, speed limit, sidewalk, surface ...) of OSM US's Layercake highways file,
     # one blob per zoom-12 tile in a PMTiles archive cut into parts of <= 400 MB (BeamNG.Earth
-    # tools/build_osm_tag_shards.py; a copy in this repo, as the tiles workflow's builder: this job holds the R2
-    # secrets, so it runs no code fetched from elsewhere). The parts (~2.4 GB in all, over Pages' 1 GB; each under the
-    # 512 MB Cloudflare's free plan caches) go to the tile host (R2 behind tiles.tgforever.net) under a key of their
-    # own build, never overwritten; only the manifest is published on Pages, pointing at them. Optional: without it the
-    # server reads the Layercake file as before.
+    # tools/build_osm_tag_shards.py; a copy in this repo, as the tiles workflow's builder). Built here WITHOUT secrets
+    # (pip's DuckDB and numpy run only in this job), sealed (tools/pack_check.py seal) and handed over as the artifact
+    # osmtags-build; osmtags_publish, the job holding the R2 secrets, checks it again and uploads it. The parts (~2.4
+    # GB in all, over Pages' 1 GB; each under the 512 MB Cloudflare's free plan caches) go to the tile host (R2 behind
+    # tiles.tgforever.net) under a key of their own build, never overwritten; only the manifest is published on
+    # Pages, pointing at them. Optional: without it the server reads the Layercake file as before.
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
         with:
           python-version: "3.12"
       - name: Tools
@@ -180,7 +183,31 @@ jobs:
           python tools/build_osm_tag_shards.py https://data.openstreetmap.us/layercake/highways.parquet \
             "$D/out/osmtags" --workers 3 --tmp "$D/tmp"
           rm -rf "$D/tmp"
-      - name: The archive's parts to the tile host, the manifest pointing at them
+          python3 -I tools/pack_check.py seal "$D/out" osmtags
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: osmtags-build
+          path: ${{ env.OTG }}/out
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 0     # (PMTiles parts of deflated tiles)
+
+  osmtags_publish:
+    # (R2 secrets: this repo's tools/pack_check.py and aws-cli only, tools/pack_publish.sh) osmtags' build checked
+    # again (names, sizes, PMTiles, the seal's SHA-256), its parts to osmtags/<key>/ (<key>: the manifest's "built",
+    # never overwritten), then the manifest pointing at them as the artifact osmtags for the site job
+    needs: osmtags
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: osmtags-build
+          path: art
+      - name: The parts to the tile host, the manifest pointing at them
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -190,51 +217,31 @@ jobs:
           # refused the parts, "InvalidPart", 2026-11-12: Cloudflare's advice is checksums only when required)
           AWS_REQUEST_CHECKSUM_CALCULATION: when_required
           AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
-        run: |
-          D=$OTG/out/osmtags
-          KEY=$(python -c "import json, re; print(re.sub(r'[^0-9A-Za-z]+', '_', json.load(open('$D/manifest.json'))['built']))")
-          aws --version; ls -l "$D"
-          aws configure set default.s3.multipart_chunksize 64MB
-          for f in "$D"/osmtags*.pmtiles; do
-            # (Cloudflare's free plan caches files up to 512 MB: a bigger part would answer every read from R2)
-            test "$(stat -c %s "$f")" -lt 536870912
-            for try in 1 2 3; do
-              aws s3 cp "$f" "s3://bnge-tiles/osmtags/$KEY/$(basename "$f")" --endpoint-url "$R2" --only-show-errors \
-                --content-type application/octet-stream --cache-control "public, max-age=31536000, immutable" && break
-              test "$try" -lt 3; sleep $((try * 20))
-            done
-          done
-          python - "$D/manifest.json" "https://tiles.tgforever.net/osmtags/$KEY" <<'PY'
-          import json, sys
-          m = json.load(open(sys.argv[1]))
-          for p in m.get("parts", []):
-              p["archive"] = f"{sys.argv[2]}/{p['archive']}"
-          if "archive" in m:
-              m["archive"] = f"{sys.argv[2]}/{m['archive']}"
-          json.dump(m, open(sys.argv[1], "w"), separators=(",", ":"))
-          PY
-          rm "$D"/osmtags*.pmtiles
-          mkdir -p out && cp -r "$D" out/
-          cat out/osmtags/manifest.json | head -c 1200; echo
-      - uses: actions/upload-artifact@v4
+          CHUNK: 64MB     # (aws-cli multipart parts of 64 MB, as this job set before)
+        run: bash tools/pack_publish.sh osmtags
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
         with:
           name: osmtags
-          path: out
+          path: pub
           retention-days: 14   # (> a week: the deploy reuses the last good one when this job fails)
+          if-no-files-found: error
 
   osmyears:
     # OpenStreetMap's building construction years (start_date) of OSM US's Layercake buildings file, one blob per
     # zoom-12 tile in PMTiles archive parts (BeamNG.Earth tools/build_osm_building_years.py, read by
-    # server/osmyears.py: pre-war towers drawn in masonry, not glass). A copy in this repo, as osmtags' builder: this
-    # job holds the R2 secrets, so it runs no code fetched from elsewhere. Each build's parts go to the tile host in
-    # a folder of their own (osmyears/<key>/, never overwritten: a running server keeps reading the build it started
-    # on), each checked against the manifest's SHA-256 first; only the manifest is published on Pages, pointing at
-    # them, after the parts. Optional: without it the towers are drawn as before.
+    # server/osmyears.py: pre-war towers drawn in masonry, not glass). A copy in this repo, as osmtags' builder, run
+    # here WITHOUT secrets; osmyears_publish (R2 secrets) checks the artifact osmyears-build again and uploads it.
+    # Each build's parts go to the tile host in a folder of their own (osmyears/<key>/, never overwritten: a running
+    # server keeps reading the build it started on), each checked against the manifest's SHA-256 first; only the
+    # manifest is published on Pages, pointing at them, after the parts. Optional: without it the towers are drawn as
+    # before.
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
         with:
           python-version: "3.12"
       - name: Tools
@@ -243,68 +250,63 @@ jobs:
         run: |
           python tools/build_osm_building_years.py https://data.openstreetmap.us/layercake/buildings.parquet \
             out/osmyears --workers 3
+          python3 -I tools/pack_check.py seal out osmyears
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: osmyears-build
+          path: out
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 0     # (PMTiles parts of deflated tiles)
+
+  osmyears_publish:
+    # (R2 secrets: this repo's tools/pack_check.py and aws-cli only, tools/pack_publish.sh) the build checked again,
+    # its parts to osmyears/<key>/ (never overwritten), then the manifest pointing at them (artifact osmyears)
+    needs: osmyears
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: osmyears-build
+          path: art
       - name: The parts to the tile host, the manifest pointing at them
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-          AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (see the osmtags job)
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (see the osmtags_publish job)
           AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
-        run: |
-          D=out/osmyears
-          KEY=$(python -c "import json, re, sys; k = json.load(open('$D/manifest.json'))['key']; assert re.fullmatch(r'[0-9A-Za-z_.-]{4,80}', k); print(k)")
-          ls -l "$D" "$D/$KEY"
-          python - "$D/manifest.json" <<'PY'
-          import hashlib, json, os, sys
-          d = os.path.dirname(sys.argv[1])
-          m = json.load(open(sys.argv[1]))
-          assert m["parts"], "no parts"
-          for p in m["parts"]:
-              assert p["archive"].startswith(m["key"] + "/"), p["archive"]
-              b = open(os.path.join(d, p["archive"]), "rb").read()
-              assert len(b) == p["bytes"] and hashlib.sha256(b).hexdigest() == p["sha256"], p["archive"]
-              assert len(b) < 536870912, p["archive"]     # (Cloudflare's free plan caches files up to 512 MB)
-          print(len(m["parts"]), "parts checked")
-          PY
-          for f in "$D/$KEY"/osmyears*.pmtiles; do
-            for try in 1 2 3; do
-              aws s3 cp "$f" "s3://bnge-tiles/osmyears/$KEY/$(basename "$f")" --endpoint-url "$R2" --only-show-errors \
-                --content-type application/octet-stream --cache-control "public, max-age=31536000, immutable" && break
-              test "$try" -lt 3; sleep $((try * 20))
-            done
-          done
-          python - "$D/manifest.json" "https://tiles.tgforever.net/osmyears" <<'PY'
-          import json, sys
-          m = json.load(open(sys.argv[1]))
-          for p in m["parts"]:
-              p["archive"] = f"{sys.argv[2]}/{p['archive']}"
-          json.dump(m, open(sys.argv[1], "w"), separators=(",", ":"))
-          PY
-          rm -r "$D/$KEY"
-          mkdir -p pub && cp -r "$D" pub/
-          head -c 1200 pub/osmyears/manifest.json; echo
-      - uses: actions/upload-artifact@v4
+        run: bash tools/pack_publish.sh osmyears
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
         with:
           name: osmyears
           path: pub
           retention-days: 14   # (> a week: the deploy reuses the last good one when this job fails)
+          if-no-files-found: error
 
   osmcolours:
     # OpenStreetMap's mapped colours of buildings and building parts (building:colour, roof:colour) as RGB, from the
     # newest planet (streamed three times by curl: nothing stored), one blob per zoom-12 tile in PMTiles archive parts
     # (BeamNG.Earth tools/build_osm_building_colours.py, read by server/osmcolours.py: the colours Overture drops,
     # filled only where its own are empty). Pinned copies in this repo (with build_osm_building_years.py and
-    # build_osm_tag_shards.py, which write its parts): this job holds the R2 secrets, so it runs no code fetched from
-    # elsewhere (the planet is data). The parts and the manifest as osmyears': each build's parts in a folder of their
-    # own (osmcolours/<key>/, never overwritten), each checked against the manifest's size and SHA-256 first, the
-    # manifest on Pages pointing at them, after the parts. Optional: without it the buildings keep Overture's colours.
+    # build_osm_tag_shards.py, which write its parts), run here WITHOUT secrets; osmcolours_publish (R2 secrets) checks
+    # the artifact osmcolours-build again and uploads it. The parts and the manifest as osmyears': each build's parts
+    # in a folder of their own (osmcolours/<key>/, never overwritten), each checked against the manifest's size and
+    # SHA-256 first, the manifest on Pages pointing at them, after the parts. Optional: without it the buildings keep
+    # Overture's colours.
     needs: planet
     runs-on: ubuntu-latest
     timeout-minutes: 340
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
         with:
           python-version: "3.12"
       - name: Tools
@@ -312,53 +314,44 @@ jobs:
       - name: Build
         run: |
           python tools/build_osm_building_colours.py "${{ needs.planet.outputs.url }}" out/osmcolours
+          python3 -I tools/pack_check.py seal out osmcolours
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: osmcolours-build
+          path: out
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 0     # (PMTiles parts of deflated tiles)
+
+  osmcolours_publish:
+    # (R2 secrets: this repo's tools/pack_check.py and aws-cli only, tools/pack_publish.sh) the build checked again,
+    # its parts to osmcolours/<key>/ (never overwritten), then the manifest pointing at them (artifact osmcolours)
+    needs: osmcolours
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: osmcolours-build
+          path: art
       - name: The parts to the tile host, the manifest pointing at them
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-          AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (see the osmtags job)
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (see the osmtags_publish job)
           AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
-        run: |
-          D=out/osmcolours
-          KEY=$(python -c "import json, re, sys; k = json.load(open('$D/manifest.json'))['key']; assert re.fullmatch(r'[0-9A-Za-z_.-]{4,80}', k); print(k)")
-          ls -l "$D" "$D/$KEY"
-          python - "$D/manifest.json" <<'PY'
-          import hashlib, json, os, sys
-          d = os.path.dirname(sys.argv[1])
-          m = json.load(open(sys.argv[1]))
-          assert m["parts"], "no parts"
-          for p in m["parts"]:
-              assert p["archive"].startswith(m["key"] + "/"), p["archive"]
-              b = open(os.path.join(d, p["archive"]), "rb").read()
-              assert len(b) == p["bytes"] and hashlib.sha256(b).hexdigest() == p["sha256"], p["archive"]
-              assert len(b) < 536870912, p["archive"]     # (Cloudflare's free plan caches files up to 512 MB)
-          print(len(m["parts"]), "parts checked,", m["rows"], "rows,", m["facade"], "facade,", m["roof"], "roof colours,",
-                m["unread"], "values not read")
-          PY
-          for f in "$D/$KEY"/osmcolours*.pmtiles; do
-            for try in 1 2 3; do
-              aws s3 cp "$f" "s3://bnge-tiles/osmcolours/$KEY/$(basename "$f")" --endpoint-url "$R2" --only-show-errors \
-                --content-type application/octet-stream --cache-control "public, max-age=31536000, immutable" && break
-              test "$try" -lt 3; sleep $((try * 20))
-            done
-          done
-          python - "$D/manifest.json" "https://tiles.tgforever.net/osmcolours" <<'PY'
-          import json, sys
-          m = json.load(open(sys.argv[1]))
-          for p in m["parts"]:
-              p["archive"] = f"{sys.argv[2]}/{p['archive']}"
-          json.dump(m, open(sys.argv[1], "w"), separators=(",", ":"))
-          PY
-          rm -r "$D/$KEY"
-          mkdir -p pub && cp -r "$D" pub/
-          head -c 1200 pub/osmcolours/manifest.json; echo
-      - uses: actions/upload-artifact@v4
+        run: bash tools/pack_publish.sh osmcolours
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
         with:
           name: osmcolours
           path: pub
           retention-days: 14   # (> a week: the deploy reuses the last good one when this job fails)
+          if-no-files-found: error
 
   osmareas:
     # OpenStreetMap's mapped road areas (area:highway=* polygons: the carriageway's real width beside the centre line,
@@ -419,7 +412,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-          AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (see the osmtags job)
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (see the osmtags_publish job)
           AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
         run: bash tools/pack_publish.sh osmareas
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
@@ -437,7 +430,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 340
     steps:
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
         with:
           python-version: "3.12"
       - name: Tools
@@ -454,7 +447,7 @@ jobs:
         run: |
           python build_station_tags.py "${{ needs.planet.outputs.url }}" out/stations
           echo "${{ needs.planet.outputs.url }}" > out/stations/planet.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
         with:
           name: stations
           path: out
@@ -466,15 +459,18 @@ jobs:
     # blob a zoom-12 tile, in PMTiles archive parts. From the Overture release pinned here (tools/overture_stac_*.json.gz:
     # its file list): the files' footers first (tail reads, cached by release), then only the row groups whose
     # statistics may hold a tall building (~7.6k row groups, ~23 GB of ranges from Overture's S3, into sparse files
-    # under /mnt). A pinned copy in this repo, as osmyears' builder: this job holds the R2 secrets, so it runs no code
-    # fetched from elsewhere. The parts and the manifest as osmyears': each build's parts in a folder of their own
+    # under /mnt). A pinned copy in this repo, as osmyears' builder, run here WITHOUT secrets; tallbld_publish (R2
+    # secrets) checks the artifact tallbld-build again and uploads it. The parts and the manifest as osmyears': each
+    # build's parts in a folder of their own
     # (tallbld/<key>/, never overwritten), each checked against the manifest's size and SHA-256 first, the manifest on
     # Pages pointing at them, after the parts. Optional: without it there are no buildings past the skyline.
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
         with:
           python-version: "3.12"
       - name: Tools
@@ -485,7 +481,7 @@ jobs:
           S=$(ls tools/overture_stac_*.json.gz | sort | tail -1)
           echo "stac=$S" >> "$GITHUB_OUTPUT"
           echo "release=$(basename "$S" .json.gz | sed 's/^overture_stac_//')" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830   # v4
         with:
           path: footers
           key: tallbld-footers-${{ steps.rel.outputs.release }}
@@ -497,62 +493,61 @@ jobs:
           python tools/build_tall_index.py --stac "${{ steps.rel.outputs.stac }}" --footers footers \
             --work /mnt/tallwork --world --pages out/tallbld
           sudo rm -rf /mnt/tallwork   # (/mnt is root's: the folder itself goes with sudo)
+          python3 -I tools/pack_check.py seal out tallbld
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: tallbld-build
+          path: out
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 0     # (PMTiles parts of deflated tiles)
+
+  tallbld_publish:
+    # (R2 secrets: this repo's tools/pack_check.py and aws-cli only, tools/pack_publish.sh) the build checked again,
+    # its parts to tallbld/<key>/ (never overwritten), then the manifest pointing at them (artifact tallbld)
+    needs: tallbld
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: tallbld-build
+          path: art
       - name: The parts to the tile host, the manifest pointing at them
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-          AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (see the osmtags job)
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (see the osmtags_publish job)
           AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
-        run: |
-          D=out/tallbld
-          KEY=$(python -c "import json, re, sys; k = json.load(open('$D/manifest.json'))['key']; assert re.fullmatch(r'[0-9A-Za-z_.-]{4,80}', k); print(k)")
-          ls -l "$D" "$D/$KEY"
-          python - "$D/manifest.json" <<'PY'
-          import hashlib, json, os, sys
-          d = os.path.dirname(sys.argv[1])
-          m = json.load(open(sys.argv[1]))
-          assert m["parts"], "no parts"
-          for p in m["parts"]:
-              assert p["archive"].startswith(m["key"] + "/"), p["archive"]
-              b = open(os.path.join(d, p["archive"]), "rb").read()
-              assert len(b) == p["bytes"] and hashlib.sha256(b).hexdigest() == p["sha256"], p["archive"]
-              assert len(b) < 536870912, p["archive"]     # (Cloudflare's free plan caches files up to 512 MB)
-          print(len(m["parts"]), "parts checked")
-          PY
-          for f in "$D/$KEY"/tallbld*.pmtiles; do
-            for try in 1 2 3; do
-              aws s3 cp "$f" "s3://bnge-tiles/tallbld/$KEY/$(basename "$f")" --endpoint-url "$R2" --only-show-errors \
-                --content-type application/octet-stream --cache-control "public, max-age=31536000, immutable" && break
-              test "$try" -lt 3; sleep $((try * 20))
-            done
-          done
-          python - "$D/manifest.json" "https://tiles.tgforever.net/tallbld" <<'PY'
-          import json, sys
-          m = json.load(open(sys.argv[1]))
-          for p in m["parts"]:
-              p["archive"] = f"{sys.argv[2]}/{p['archive']}"
-          json.dump(m, open(sys.argv[1], "w"), separators=(",", ":"))
-          PY
-          rm -r "$D/$KEY"
-          mkdir -p pub && cp -r "$D" pub/
-          head -c 1200 pub/tallbld/manifest.json; echo
-      - uses: actions/upload-artifact@v4
+        run: bash tools/pack_publish.sh tallbld
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
         with:
           name: tallbld
           path: pub
           retention-days: 14   # (> a week: the deploy reuses the last good one when this job fails)
+          if-no-files-found: error
 
   site:
-    needs: [rail, lanes, signs, osmtags, osmyears, osmcolours, osmareas_publish, stations, tallbld, routes]
+    needs: [rail, lanes, signs, osmtags_publish, osmyears_publish, osmcolours_publish, osmareas_publish, stations,
+            tallbld_publish, routes]
     # (the sign shards, the OSM road tags and the stations are optional: a failed signs / osmtags / stations job leaves
-    # them out, the rail and lane data still publish; osmyears, osmcolours and osmareas likewise)
+    # them out, the rail and lane data still publish; osmyears, osmcolours and osmareas likewise; a failed build job
+    # skips its publish job, which waits for it)
     if: ${{ !cancelled() && needs.rail.result == 'success' && needs.lanes.result == 'success' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read   # (an optional job that failed keeps its last good artifact)
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
         with:
           path: parts
           # (every artifact of this run but the builds handed to the publish jobs, <name>-build: their parts are on
@@ -609,6 +604,12 @@ jobs:
             tar xf parts/de-roads-16-states.tar -C site; rm -f parts/de-roads-16-states.tar
           else
             rm -f parts/de-roads-16-states.tar; echo "deroads: not published this run"; fi
+          # (a link out of the site, from a release's tar: dropped, else the Pages artifact (tar --dereference) and the
+          # R2 mirror below (aws s3 cp follows links) would publish the runner's file it names)
+          R=$(readlink -f site)
+          find site -type l | while read -r l; do
+            case "$(readlink -f "$l")" in "$R/"*) ;; *) echo "::warning::$l: a link out of the site, not published"; rm -f "$l";; esac
+          done
           du -sh site; du -sh site/* | sort -h | tail -8
           cp README.md site/
           printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>, lane-level road tags: <a href="lanes/manifest.json">lanes/manifest.json</a>, highway sign sources: <a href="signs/manifest.json">signs/manifest.json</a>, US road-route membership: <a href="routes/manifest.json">routes/manifest.json</a>, fuel and charging stations: <a href="stations/manifest.json">stations/manifest.json</a>, level crossings (US): <a href="fra/manifest.json">fra/manifest.json</a>, measured German roofs: <a href="lod2/manifest.json">lod2/manifest.json</a> (sources and licences: <a href="lod2/ATTRIBUTION.md">lod2/ATTRIBUTION.md</a>), surveyed German roads: <a href="deroads/ATTRIBUTION.md">deroads/ATTRIBUTION.md</a>, measured roofs of Switzerland, Estonia and Vienna: <a href="lod2-ch/ATTRIBUTION.md">lod2-ch</a>, <a href="lod2-ee/ATTRIBUTION.md">lod2-ee</a>, <a href="lod2-wien/ATTRIBUTION.md">lod2-wien</a>, New York building massing: <a href="nycmassing/v1/manifest.json">nycmassing/v1/manifest.json</a> (<a href="nycmassing/ATTRIBUTION.md">nycmassing/ATTRIBUTION.md</a>). Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
@@ -624,12 +625,12 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-          AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (see the osmtags job)
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (see the osmtags_publish job)
           AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
         run: |
           aws configure set default.s3.max_concurrent_requests 32
-          python3 tools/mirror_data.py site
-      - uses: actions/upload-pages-artifact@v3
+          python3 -I tools/mirror_data.py site
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa   # v3
         with:
           path: site
 
@@ -639,9 +640,14 @@ jobs:
     # when anything before it failed, and the 2026-11-11 run built the site and never deployed it)
     if: ${{ !cancelled() && needs.site.result == 'success' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - id: deploy
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e   # v4

@@ -110,11 +110,11 @@ jobs:
       matrix:
         chunk: ${{ fromJson(needs.plan.outputs.chunks) }}
     steps:
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
         with:
           python-version: "3.12"
       - run: pip install numpy pillow
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
       - name: "The builder (tools/build_s2_packs.py, server/tilepack.py: copies from BeamNG.Earth in this repo)"
         run: |
           test -f tools/build_s2_packs.py && test -f server/tilepack.py
@@ -214,11 +214,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
         with:
           python-version: "3.12"
       - run: pip install numpy pillow
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
       - run: |
           test -f tools/build_s2_packs.py && test -f server/tilepack.py
       - name: "Zooms 7..3 from the zoom-8 packs"
