@@ -95,8 +95,10 @@ degrees), its DOM height and, for every 4th sample, its DGM height (cm). Built b
 `tools/build_de_decks.py` (PR #1531, Henner4746). 14 states (Thuringia is still being built; Saarland publishes no
 open DOM), 677 shards, 645 MB; under dl-de/by-2-0, dl-de/zero-2.0 and CC BY 4.0, with each state's attribution in
 `dedecks/ATTRIBUTION.md`. The data workflow unpacks this repo's release `dedecks.tar`, or, until there is one, the
-release on Henner4746's fork whose SHA-256 the workflow pins. The shards are on the tile host only (the manifest's
-"data"): Pages keeps `dedecks/manifest.json` and `dedecks/ATTRIBUTION.md`, since the site is over 1 GB already.
+release on Henner4746's fork whose SHA-256 the workflow pins. Before unpacking, `tools/safe_tar.py` lists the tar and
+refuses it as a whole unless every entry is a regular file or folder under `dedecks/` (no links, absolute or `../`
+paths); then only `dedecks/` is unpacked. The shards are on the tile host only (the manifest's "data"): Pages keeps
+`dedecks/manifest.json` and `dedecks/ATTRIBUTION.md`, since the site is over 1 GB already.
 
 ## dem/mapterhorn/: Mapterhorn's elevation tiles z0-12 (tile host only, workflow "dem")
 

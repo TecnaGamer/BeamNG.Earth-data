@@ -540,14 +540,21 @@ jobs:
           # surface and terrain models, DOM / DGM): static, holding dedecks/ (677 shards, 645 MB, each state's licence in
           # dedecks/ATTRIBUTION.md). From this repo's release "dedecks-data" (asset dedecks.tar) when there is one, else
           # the release the PR names on Henner4746's fork, kept only when its SHA-256 is the one pinned here (optional).
-          # Its shards go to the tile host only: the step after the mirror takes them off the Pages site again.
+          # Either tar is listed first (tools/safe_tar.py): refused as a whole unless every entry is a regular file or
+          # folder under dedecks/ (no links, no absolute or ../ paths, nothing of another dataset), then only dedecks/
+          # is unpacked. Its shards go to the tile host only: the step after the mirror takes them off the Pages site.
           DEDECKS_SHA=822e62f78755a10aa794afaf09aef359e811cf540a1796dc187576bf2242606b
+          DEDECKS_TAR=
           if gh release download dedecks-data -R "$GITHUB_REPOSITORY" -p dedecks.tar -D parts 2>/dev/null; then
-            tar xf parts/dedecks.tar -C site; rm -f parts/dedecks.tar
+            DEDECKS_TAR=parts/dedecks.tar
           elif gh release download de-decks-data-2026-11-22 -R Henner4746/BeamNG.Earth -p de-decks-2026-11-22.tar -D parts 2>/dev/null && echo "$DEDECKS_SHA  parts/de-decks-2026-11-22.tar" | sha256sum -c -; then
-            tar xf parts/de-decks-2026-11-22.tar -C site; rm -f parts/de-decks-2026-11-22.tar
+            DEDECKS_TAR=parts/de-decks-2026-11-22.tar
+          fi
+          if [ -n "$DEDECKS_TAR" ] && python3 tools/safe_tar.py "$DEDECKS_TAR" dedecks; then
+            tar xf "$DEDECKS_TAR" -C site --no-same-owner --no-same-permissions dedecks
           else
-            rm -f parts/de-decks-2026-11-22.tar; echo "dedecks: not published this run"; fi
+            rm -rf site/dedecks; echo "dedecks: not published this run"; fi
+          rm -f parts/dedecks.tar parts/de-decks-2026-11-22.tar
           du -sh site; du -sh site/* | sort -h | tail -8
           cp README.md site/
           printf '<!doctype html><meta charset="utf-8"><title>BeamNG.Earth data</title><p>Data for <a href="https://github.com/TecnaGamer/BeamNG.Earth">BeamNG.Earth</a>. Railways: <a href="rail/manifest.json">rail/manifest.json</a>, lane-level road tags: <a href="lanes/manifest.json">lanes/manifest.json</a>, highway sign sources: <a href="signs/manifest.json">signs/manifest.json</a>, US road-route membership: <a href="routes/manifest.json">routes/manifest.json</a>, fuel and charging stations: <a href="stations/manifest.json">stations/manifest.json</a>, level crossings (US): <a href="fra/manifest.json">fra/manifest.json</a>, measured German roofs: <a href="lod2/manifest.json">lod2/manifest.json</a> (sources and licences: <a href="lod2/ATTRIBUTION.md">lod2/ATTRIBUTION.md</a>), surveyed German roads: <a href="deroads/ATTRIBUTION.md">deroads/ATTRIBUTION.md</a>, measured German bridge decks: <a href="dedecks/ATTRIBUTION.md">dedecks/ATTRIBUTION.md</a>, measured roofs of Switzerland, Estonia and Vienna: <a href="lod2-ch/ATTRIBUTION.md">lod2-ch</a>, <a href="lod2-ee/ATTRIBUTION.md">lod2-ee</a>, <a href="lod2-wien/ATTRIBUTION.md">lod2-wien</a>, New York building massing: <a href="nycmassing/v1/manifest.json">nycmassing/v1/manifest.json</a> (<a href="nycmassing/ATTRIBUTION.md">nycmassing/ATTRIBUTION.md</a>). Data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL 1.0.\n' > site/index.html
