@@ -453,6 +453,36 @@ jobs:
           path: out
           retention-days: 14   # (> a week: the deploy reuses the last good one when this job fails)
 
+  drive:
+    # OpenStreetMap's mapped driving features that neither Overture nor the Layercake highways file carry (drive/, read
+    # by BeamNG.Earth's server/drivetags.py, only while one of its mapped-feature switches is on): traffic calming,
+    # turning circles / loops, mini roundabouts, passing places, fords, railway signals / points / buffer stops, and
+    # the tracktype / ford / traffic_calming of highway ways. Optional like the signs: a failed job leaves it out.
+    needs: planet
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
+        with:
+          python-version: "3.12"
+      - name: Tools
+        run: pip install "osmium==4.3.2" numpy
+      - name: "The builder (tools/build_drive_tags.py from BeamNG.Earth, with build_rail_tags.py it uses)"
+        run: |
+          B=https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev
+          for f in tools/npyfirst.py server/npyguard.py tools/build_rail_tags.py tools/build_drive_tags.py; do
+            curl -sfL -o "$(basename "$f")" "$B/$f"
+          done
+      - name: Build
+        run: |
+          python build_drive_tags.py "${{ needs.planet.outputs.url }}" out/drive
+          echo "${{ needs.planet.outputs.url }}" > out/drive/planet.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: drive
+          path: out
+          retention-days: 14   # (> a week: the deploy reuses the last good one when this job fails)
+
   tallbld:
     # The tall-building index for the horizon ring (BeamNG.Earth tools/build_tall_index.py, read by server/bldhz.py):
     # every Overture building at least 60 m tall (its height, its storeys or one of its parts) with all its parts, one
@@ -534,7 +564,7 @@ jobs:
 
   site:
     needs: [rail, lanes, signs, osmtags_publish, osmyears_publish, osmcolours_publish, osmareas_publish, stations,
-            tallbld_publish, routes]
+            tallbld_publish, routes, drive]
     # (the sign shards, the OSM road tags and the stations are optional: a failed signs / osmtags / stations job leaves
     # them out, the rail and lane data still publish; osmyears, osmcolours and osmareas likewise; a failed build job
     # skips its publish job, which waits for it)
@@ -560,7 +590,7 @@ jobs:
           mkdir -p site
           # an optional job that failed this time: its last good artifact from an earlier run instead (a deploy
           # replaces the whole site, so a failed signs job took the sign shards off Pages from 2026-11-13 on)
-          for n in signs osmtags osmyears osmcolours osmareas tallbld stations routes; do
+          for n in signs osmtags osmyears osmcolours osmareas tallbld stations routes drive; do
             [ -d "parts/$n" ] && continue
             id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$n&per_page=20" -q '[.artifacts[] | select(.expired | not)][0].workflow_run.id // empty' || true)
             if [ -n "$id" ] && gh run download "$id" -R "$GITHUB_REPOSITORY" -n "$n" -D "parts/$n"; then
@@ -576,6 +606,7 @@ jobs:
           if [ -d parts/tallbld ]; then cp -r parts/tallbld/* site/; fi
           if [ -d parts/stations ]; then cp -r parts/stations/* site/; fi
           if [ -d parts/routes ]; then cp -r parts/routes/* site/; fi
+          if [ -d parts/drive ]; then cp -r parts/drive/* site/; fi
           # PR #505's regional scenery data (BeamNG.Earth tools/build_regional_data.py): static, from this repo's
           # release "regional-data" (asset regional.tar), unpacked as site/regional (optional: without it the rest publishes)
           if gh release download regional-data -R "$GITHUB_REPOSITORY" -p regional.tar -D parts 2>/dev/null; then
