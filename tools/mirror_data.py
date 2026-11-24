@@ -110,6 +110,11 @@ def mirror(site, ds, all_ds):
     path = os.path.join(site, ds, "manifest.json")
     with open(path, encoding="utf-8") as f:
         m = json.load(f)
+    d = m.get("data")
+    if isinstance(d, str) and d.startswith(f"{PUBLIC}/{PREFIX}/{ds}/"):
+        # (the weekly shard datasets: published by their own job, tools/shard_publish.sh, before the manifest came here)
+        print(f"{ds}: on the tile host already ({d})", flush=True)
+        return d
     files, inner = files_of(site, ds, all_ds)
     if not files:
         print(f"{ds}: no files, left on Pages", flush=True)
