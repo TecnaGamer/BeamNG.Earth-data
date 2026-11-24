@@ -1,0 +1,261 @@
+# BeamNG.Earth's own cloud-free Sentinel-2 composite of 2025 ("s2c"; the user's go 2026-11-23: "Go with the 2025") as
+# tile packs on the tile host (Cloudflare R2 bnge-tiles behind tiles.tgforever.net) under s2c/v1/: {z}/{px}/{py}.bngp
+# for zooms 8-14 (14 within 50 degrees, 13 beyond), the shard and region records under s2c/v1/_build/s2c/v1/, and
+# s2c/v1/index.json written LAST once the planet is complete. Built by tools/build_s2c_packs.py (this repo's pinned copy
+# of BeamNG.Earth's) from Element84 Earth Search's sentinel-2-c1-l2a (AWS Open Data; Copernicus Sentinel data terms:
+# any use, redistribution; credit "Contains modified Copernicus Sentinel data 2024-2025"). Players read the packs only
+# once a server build knows "bngs2c" and cdn.json {"imagery": {"bngs2c": {"enabled": true}}} turns it on (a hand
+# commit after the index is published; README-s2c.md).
+#
+# The builder runs ONLY in jobs without secrets (pip's numpy / Pillow at the pinned versions; tools/s2c_pins.json); the
+# jobs holding the R2 secrets run nothing but this repo's tools/s2c_ci.py (standard library, python3 -I) and aws-cli:
+# every pack checked against its shard's record (size, SHA-256, BNGP of that shard, WebP tiles), the record against
+# this checkout's builder and the pins; a pack in the bucket with another size refuses the upload (never overwritten);
+# the packs first, the record (the shard's done marker) after them.
+#
+# Stages (input "stage"), each resumable (a shard / region with a record in the bucket is never built again):
+#   shards  zoom-8 shards: zooms 14..11 (64 zoom-14 packs, 16 zoom-13, 4 zoom-12, 1 zoom-11 each). The planet is
+#           tools/s2c_shards.txt (19,174 shards: every zoom-8 tile meeting a 1-degree cell of ESA WorldCover's 2021
+#           composite, as the 2021 packs). "only": shard numbers "x,y ..." (a trial); "region": zoom-5 tiles.
+#   coarse  zoom-5 regions whose shards are all done: zooms 10..8 from their zoom-11 packs (read through the CDN)
+#   world   once every region is done: zooms 7..3 from the zoom-8 packs (read through the CDN), one job
+#   index   once every shard, region and the world are done: s2c/v1/index.json (counts, bytes), last
+#   ingest  home machines' shards (build_s2c_packs.py with the pinned Pillow, tarred: README-s2c.md) from this repo's
+#           release "release" (assets s2c-home-*.tar), unpacked by the checker and uploaded as a runner's
+# Estimate (one zoom-8 shard measured on a PC, 2026-11-23: see README-s2c.md): planet ~N runner-hours, ~S GB.
+# Secrets (repo settings): R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.
+name: tiles-s2c
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: '"shards", "coarse", "world", "index" or "ingest"'
+        default: "shards"
+      only:
+        description: 'shards: blank for the planet, else zoom-8 tiles "x,y x,y ..." (a trial)'
+        default: ""
+      region:
+        description: 'shards / coarse: blank for all, else zoom-5 tiles "x,y ..."'
+        default: ""
+      jobs:
+        description: "build jobs in this run (<= 250; 20 at once, each up to ~5 h)"
+        default: "200"
+      workers:
+        description: "pack processes per job (4 vCPUs, 16 GB)"
+        default: "4"
+      release:
+        description: 'ingest: the release tag holding s2c-home-*.tar'
+        default: "s2c-home"
+      plan:
+        description: 'shards: blank (ask STAC live), or the release tag holding s2c-stac-plan.tar.gz (the frozen scene choices)'
+        default: ""
+      dry_run:
+        description: "build and check only: no upload"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tiles-s2c
+  cancel-in-progress: false
+
+env:
+  BUCKET: bnge-tiles
+  PREFIX: s2c/v1
+  CDN: https://tiles.tgforever.net
+
+jobs:
+  inputs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inputs
+        env:
+          STAGE: ${{ github.event.inputs.stage }}
+          ONLY: ${{ github.event.inputs.only }}
+          REGION: ${{ github.event.inputs.region }}
+          JOBS: ${{ github.event.inputs.jobs }}
+          WORKERS: ${{ github.event.inputs.workers }}
+          RELEASE: ${{ github.event.inputs.release }}
+          PLAN: ${{ github.event.inputs.plan }}
+        run: |
+          [[ "$PLAN" =~ ^[A-Za-z0-9._-]{0,60}$ ]] || { echo "::error::bad plan"; exit 1; }
+          [[ "$STAGE" =~ ^(shards|coarse|world|index|ingest)$ && "$ONLY" =~ ^[0-9,\ ]*$ && "$REGION" =~ ^[0-9,\ ]*$ \
+             && "$JOBS" =~ ^[0-9]{1,3}$ && "$WORKERS" =~ ^[1-8]$ && "$RELEASE" =~ ^[A-Za-z0-9._-]{1,60}$ ]] \
+            || { echo "::error::bad inputs"; exit 1; }
+
+  listing:
+    # (secrets: aws-cli only) the records in the bucket (what is done)
+    needs: inputs
+    runs-on: ubuntu-latest
+    steps:
+      - name: The records under s2c/v1/_build/
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          set -euo pipefail
+          # (list-objects-v2 exits 0 on an empty prefix and non-zero on an auth / network error: no silent "nothing done")
+          aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$PREFIX/_build/" --endpoint-url "$R2" --output json > listing.json
+          echo "$(grep -c '"Key"' listing.json || true) records under $PREFIX/_build/"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: s2c-listing
+          path: listing.json
+          retention-days: 3
+
+  plan:
+    # (no secrets) the matrix: shards to build, regions to coarsen, or home tarballs to take in
+    needs: listing
+    runs-on: ubuntu-latest
+    outputs:
+      entries: ${{ steps.plan.outputs.entries }}
+      index: ${{ steps.plan.outputs.index }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: s2c-listing
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAGE: ${{ github.event.inputs.stage }}
+          ONLY: ${{ github.event.inputs.only }}
+          REGION: ${{ github.event.inputs.region }}
+          JOBS: ${{ github.event.inputs.jobs }}
+          RELEASE: ${{ github.event.inputs.release }}
+        run: |
+          set -euo pipefail
+          chk() { python3 -I tools/s2c_ci.py "$@"; }
+          case "$STAGE" in
+            shards)
+              chk plan --listing listing.json --planet tools/s2c_shards.txt --jobs "$JOBS" --only "$ONLY" --region "$REGION" \
+                2> plan.log > plan.json
+              cat plan.log | tee -a "$GITHUB_STEP_SUMMARY"
+              python3 -I -c 'import json; print("entries=" + json.dumps([dict(e, kind="shards", items=e["shards"]) for e in json.load(open("plan.json"))["entries"]], separators=(",", ":")))' >> "$GITHUB_OUTPUT" ;;
+            coarse)
+              chk coarse-plan --listing listing.json --planet tools/s2c_shards.txt --region "$REGION" 2> plan.log > plan.json
+              cat plan.log | tee -a "$GITHUB_STEP_SUMMARY"
+              python3 -I - "$JOBS" <<'PY' >> "$GITHUB_OUTPUT"
+          import json, sys
+          r = json.load(open("plan.json"))["regions"].split()
+          n = max(1, min(len(r), int(sys.argv[1]), 20)) if r else 0
+          print("entries=" + json.dumps([{"id": f"s2c-coarse-{j:03d}", "kind": "coarse", "items": " ".join(r[j::n])}
+                                         for j in range(n)], separators=(",", ":")))
+          PY
+              ;;
+            world)
+              chk world-plan --listing listing.json --planet tools/s2c_shards.txt 2> plan.log > plan.json
+              cat plan.log | tee -a "$GITHUB_STEP_SUMMARY"
+              python3 -I -c 'import json; r = json.load(open("plan.json"))["ready"]; print("entries=" + json.dumps([{"id": "s2c-world-000", "kind": "world", "items": "0,0"}] if r else []))' >> "$GITHUB_OUTPUT" ;;
+            ingest)
+              gh release view "$RELEASE" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' > assets.txt
+              grep -E '^s2c-home-[A-Za-z0-9._-]{1,80}\.tar$' assets.txt > tars.txt || true
+              echo "$(wc -l < tars.txt) home tarballs in $RELEASE" | tee -a "$GITHUB_STEP_SUMMARY"
+              python3 -I -c 'import json; t = open("tars.txt").read().split(); print("entries=" + json.dumps([{"id": f"s2c-home-{i:03d}", "kind": "ingest", "items": n} for i, n in enumerate(t)], separators=(",", ":")))' >> "$GITHUB_OUTPUT" ;;
+            index)
+              echo "entries=[]" >> "$GITHUB_OUTPUT"
+              echo "index=true" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  build:
+    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.entries != '[]' && needs.plan.outputs.entries != '' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        entry: ${{ fromJson(needs.plan.outputs.entries) }}
+    permissions:
+      contents: read
+      actions: write
+    uses: ./.github/workflows/tiles_s2c-shards.yml
+    with:
+      id: ${{ matrix.entry.id }}
+      kind: ${{ matrix.entry.kind }}
+      items: ${{ matrix.entry.items }}
+      workers: ${{ github.event.inputs.workers || '4' }}
+      release: ${{ github.event.inputs.release || 's2c-home' }}
+      plan: ${{ github.event.inputs.plan }}
+      dry_run: ${{ github.event.inputs.dry_run == 'true' }}
+    secrets:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+  index-listing:
+    # (secrets: aws-cli only) the whole prefix, for the index
+    needs: plan
+    if: ${{ needs.plan.outputs.index == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          set -euo pipefail
+          aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$PREFIX/" --endpoint-url "$R2" --output json \
+            --query 'Contents[].{Key: Key, Size: Size}' > keys.json
+          python3 -I -c 'import json; json.dump({"Contents": json.load(open("keys.json")) or []}, open("listing.json", "w"))'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: s2c-full-listing
+          path: listing.json
+          retention-days: 3
+
+  index:
+    # (no secrets) index.json when the planet is complete
+    needs: index-listing
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.idx.outputs.ready }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: s2c-full-listing
+      - id: idx
+        run: |
+          set -euo pipefail
+          python3 -I tools/s2c_ci.py index pub --listing listing.json --planet tools/s2c_shards.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ -f pub/index.json ]; then echo "ready=true" >> "$GITHUB_OUTPUT"; fi
+      - if: ${{ steps.idx.outputs.ready == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: s2c-index
+          path: pub/index.json
+          retention-days: 7
+
+  publish-index:
+    # (secrets: aws-cli only) index.json, last
+    needs: index
+    if: ${{ needs.index.outputs.ready == 'true' && github.event.inputs.dry_run != 'true' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: s2c-index
+          path: pub
+      - env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          set -euo pipefail
+          [ "$(ls pub)" = "index.json" ] && [ "$(stat -c %s pub/index.json)" -lt 1048576 ]
+          python3 -I -c 'import json; d = json.load(open("pub/index.json")); assert d["prefix"] == "s2c/v1" and d["format"] == 1'
+          aws s3 cp pub/index.json "s3://$BUCKET/$PREFIX/index.json" --endpoint-url "$R2" --only-show-errors \
+            --content-type application/json --cache-control "public, max-age=3600"
+          echo "published: $PREFIX/index.json" | tee -a "$GITHUB_STEP_SUMMARY"

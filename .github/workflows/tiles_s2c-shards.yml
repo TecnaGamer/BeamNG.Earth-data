@@ -1,0 +1,198 @@
+# One build job of the tiles-s2c workflow (tiles_s2c.yml) and its upload: called once per matrix entry, so a job's
+# output goes to the bucket as soon as it is built (artifacts never hold more than ~20 jobs' output at once).
+#   build:  NO secrets. This repo's tools/build_s2c_packs.py (pip's numpy / Pillow at the pins; its --selftest must
+#           give the pinned SHA-256 first: the WebP encoder is the one the pins name) builds the entry's zoom-8 shards
+#           (kind "shards") or zoom-5 regions' zooms 10..8 from the published zoom-11 packs (kind "coarse"), none
+#           started after the time budget; or (kind "ingest") unpacks a home machine's tarball from this repo's release
+#           with the checker (regular files with pack / record names only). The output (packs and records) becomes an
+#           artifact.
+#   upload: the R2 secrets; runs only this repo's tools/s2c_ci.py (check: every file a pack or record, every pack its
+#           record's size and SHA-256, a BNGP pack of that shard with WebP tiles, the record this checkout's builder and
+#           the pins; anything else rejects the artifact) and aws-cli: the packs' columns listed (a pack there with
+#           another size refuses: never overwritten; with its size: not sent again), the packs, the listing checked
+#           again, the records (the done markers) last; then deletes the artifact.
+name: tiles-s2c-shards
+
+on:
+  workflow_call:
+    inputs:
+      id: {type: string, required: true}
+      kind: {type: string, required: true}
+      items: {type: string, required: true}
+      workers: {type: string, default: "4"}
+      release: {type: string, default: "s2c-home"}
+      plan: {type: string, default: ""}
+      dry_run: {type: boolean, default: false}
+    secrets:
+      R2_ACCOUNT_ID: {required: false}
+      R2_ACCESS_KEY_ID: {required: false}
+      R2_SECRET_ACCESS_KEY: {required: false}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    outputs:
+      artifact: ${{ steps.art.outputs.artifact-id }}
+    steps:
+      - name: Inputs
+        env:
+          ID: ${{ inputs.id }}
+          KIND: ${{ inputs.kind }}
+          ITEMS: ${{ inputs.items }}
+          WORKERS: ${{ inputs.workers }}
+          RELEASE: ${{ inputs.release }}
+          PLAN: ${{ inputs.plan }}
+        run: |
+          [[ "$PLAN" =~ ^[A-Za-z0-9._-]{0,60}$ ]] || { echo "::error::bad plan"; exit 1; }
+          [[ "$ID" =~ ^s2c-([a-z]+-)?[0-9]{3}$ && "$KIND" =~ ^(shards|coarse|world|ingest)$ && "$WORKERS" =~ ^[1-8]$ \
+             && "$RELEASE" =~ ^[A-Za-z0-9._-]{1,60}$ ]] || { echo "::error::bad inputs"; exit 1; }
+          if [ "$KIND" = ingest ]; then [[ "$ITEMS" =~ ^s2c-home-[A-Za-z0-9._-]{1,80}\.tar$ ]]; else [[ "$ITEMS" =~ ^[0-9,\ ]+$ ]]; fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
+        with:
+          python-version: "3.12"
+      - name: Packages (the pins), the self-test, room on the runner
+        run: |
+          set -euo pipefail
+          read -r NP PL ST < <(python3 -I -c 'import json; p = json.load(open("tools/s2c_pins.json")); print(p["numpy"], p["pillow"], p["selftest"])')
+          [[ "$NP" =~ ^[0-9.]+$ && "$PL" =~ ^[0-9.]+$ && "$ST" =~ ^[0-9a-f]{64}$ ]]
+          python -m pip install -q "numpy==$NP" "pillow==$PL"
+          got=$(python tools/build_s2c_packs.py x --selftest | cut -d' ' -f1)
+          [ "$got" = "$ST" ] || { echo "::error::selftest $got is not the pinned $ST (another WebP encoder?)"; exit 1; }
+          D=/mnt/s2c; [ "$(df --output=avail -B1G /mnt 2>/dev/null | tail -1)" -gt 20 ] 2>/dev/null || D=$HOME/s2c
+          sudo mkdir -p "$D" && sudo chown "$USER" "$D"
+          echo "D=$D" >> "$GITHUB_ENV"
+          df -h / /mnt || true; free -h; nproc
+      - name: Build (or take in a home machine's tarball)
+        timeout-minutes: 330
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIND: ${{ inputs.kind }}
+          ITEMS: ${{ inputs.items }}
+          WORKERS: ${{ inputs.workers }}
+          RELEASE: ${{ inputs.release }}
+          PLAN: ${{ inputs.plan }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$D/out" "$D/stac"
+          if [ "$KIND" = shards ] && [ -n "$PLAN" ]; then
+            # (the frozen scene choices: JSON files the builder reads with json.load; names checked, no links)
+            gh release download "$PLAN" -R "$GITHUB_REPOSITORY" -p s2c-stac-plan.tar.gz -D "$D/plan" || exit 1
+            python3 -I tools/s2c_ci.py untar-plan "$D/plan/s2c-stac-plan.tar.gz" "$D/stac" || exit 1
+          fi
+          DEADLINE=$(( $(date +%s) + 290 * 60 ))      # (no shard started after 4 h 50 min: a shard takes ~10-40 min)
+          ( while sleep 300; do
+              echo "[mon] load $(cut -d' ' -f1-3 /proc/loadavg), rx $(awk 'NR > 2 && $1 !~ /^lo:/ {s += $2} END {print int(s / 1e6)}' /proc/net/dev) MB, $(free -m | awk '/Mem/ {print $3}') MB used, $(df -m "$D" | awk 'NR == 2 {print $4}') MB free"
+            done ) &
+          MON=$!
+          trap 'kill $MON 2>/dev/null || true' EXIT
+          rc=0
+          case "$KIND" in
+            shards)
+              python tools/build_s2c_packs.py "$D/out" --shards "$ITEMS" --workers "$WORKERS" --threads 24 \
+                --cache "$D/stac" --deadline "$DEADLINE" || rc=$? ;;
+            coarse)
+              python tools/build_s2c_packs.py "$D/out" --coarse "$ITEMS" --from "https://tiles.tgforever.net/s2c/v1" || rc=$? ;;
+            world)
+              python tools/build_s2c_packs.py "$D/out" --world --from "https://tiles.tgforever.net/s2c/v1" || rc=$? ;;
+            ingest)
+              mkdir -p "$D/tar"
+              gh release download "$RELEASE" -R "$GITHUB_REPOSITORY" -p "$ITEMS" -D "$D/tar" || rc=$?
+              [ "$(ls "$D/tar")" = "$ITEMS" ] || { echo "::error::the release gave other files"; rc=1; }
+              [ "$rc" -eq 0 ] && { python3 -I tools/s2c_ci.py untar "$D/tar/$ITEMS" "$D/out" || rc=$?; } ;;
+          esac
+          find "$D/out" -name '*.tmp' -delete
+          echo "$KIND $ITEMS: status $rc, $(find "$D/out" -name '*.bngp' | wc -l) packs, $(du -sm "$D/out" | cut -f1) MB" | tee -a "$GITHUB_STEP_SUMMARY"
+          # (75: the deadline left shards for the next run: what is built goes up)
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 75 ]; then echo "::warning::status $rc (finished shards still go up)"; echo "FAILED=1" >> "$GITHUB_ENV"; fi
+      - id: art
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: ${{ inputs.id }}
+          path: ${{ env.D }}/out/
+          retention-days: 3
+          compression-level: 0          # (WebP already)
+          if-no-files-found: ignore
+          overwrite: true
+      - if: ${{ env.FAILED == '1' }}
+        run: exit 1
+
+  upload:
+    needs: build
+    if: ${{ !cancelled() && !inputs.dry_run && needs.build.outputs.artifact != '' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: ${{ inputs.id }}
+          path: in
+      - name: Check, then the packs, then the records
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (R2 refused aws-cli's default checksums: rail.yml)
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          set -euo pipefail
+          B=bnge-tiles
+          chk() { python3 -I tools/s2c_ci.py "$@"; }
+          # (in/ may hold a cut-off shard's packs without a record: reported, never uploaded)
+          # (anything but a cut-off shard's packs refuses the whole artifact, as cip_ci.py check)
+          chk check in stage --pins tools/s2c_pins.json | tee -a "$GITHUB_STEP_SUMMARY"
+          [ -d stage/records ] || { echo "nothing accepted to upload"; exit 0; }
+          L=()
+          if [ -d stage/packs ]; then
+            chk columns stage > columns.txt
+            i=0
+            while read -r col; do
+              [[ "$col" =~ ^s2c/v1/[0-9]{1,2}/[0-9]{1,6}/$ ]] || { echo "::error::bad column $col"; exit 1; }
+              aws s3api list-objects-v2 --bucket "$B" --prefix "$col" --endpoint-url "$R2" --output json > "col$i.json"
+              L+=(--listing "col$i.json"); i=$((i + 1))
+            done < columns.txt
+            chk todo stage "${L[@]}" > todo.txt
+            while read -r f k; do
+              # (the names come from the checked records, never from a listing of the artifact)
+              [[ "$f" =~ ^stage/packs/[0-9]{1,2}/[0-9]{1,6}/[0-9]{1,6}\.bngp$ && "$k" == "s2c/v1/${f#stage/packs/}" ]] \
+                || { echo "::error::bad upload line: $f $k"; exit 1; }
+              for try in 1 2 3; do
+                aws s3 cp "$f" "s3://$B/$k" --endpoint-url "$R2" --only-show-errors --content-type application/octet-stream \
+                  --cache-control "public, max-age=31536000, immutable" < /dev/null && break
+                test "$try" -lt 3; sleep $((try * 20))
+              done
+            done < todo.txt
+            L=(); i=0
+            while read -r col; do
+              aws s3api list-objects-v2 --bucket "$B" --prefix "$col" --endpoint-url "$R2" --output json > "after$i.json"
+              L+=(--listing "after$i.json"); i=$((i + 1))
+            done < columns.txt
+            chk todo stage "${L[@]}" --complete | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          # (last: the shards' / regions' done markers)
+          find stage/records -type f | sort > recs.txt
+          while read -r f; do
+            [[ "$f" =~ ^stage/records/_build/s2c/v1/(shards|coarse|world)/[0-9]{1,3}_[0-9]{1,3}\.json$ ]] || { echo "::error::bad record $f"; exit 1; }
+            aws s3 cp "$f" "s3://$B/s2c/v1/${f#stage/records/}" --endpoint-url "$R2" --only-show-errors \
+              --content-type application/json --cache-control "no-cache" < /dev/null
+          done < recs.txt
+          echo "$(wc -l < recs.txt) records uploaded" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: The artifact, now in the bucket, deleted
+        if: ${{ success() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ID: ${{ needs.build.outputs.artifact }}
+        run: gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$ID" || true
