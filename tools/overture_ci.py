@@ -303,11 +303,15 @@ def compare_counts(names, old, new, max_drop=MAX_DROP_PCT, max_grow=MAX_GROW_PCT
         if po.get("cells") != pn.get("cells"):
             problems.append(f"{name}: counted on other cells")
         for layer in sorted(set(po.get("layers", {})) | set(pn.get("layers", {}))):
-            if layer not in po.get("layers", {}) or layer not in pn.get("layers", {}):
-                # (a layer only one side counts: the app tree added it, e.g. the natural features' land and
+            if layer not in po.get("layers", {}):
+                # (a layer the baseline doesn't count: the app tree added it, e.g. the natural features' land and
                 # bathymetry; no baseline to bound it by yet)
-                lines.append(f"| {name} | {layer} | {po['layers'].get(layer, '-')} | {pn['layers'].get(layer, '-')} | "
-                             f"new |")
+                lines.append(f"| {name} | {layer} | - | {pn['layers'].get(layer, '-')} | new |")
+                continue
+            if layer not in pn.get("layers", {}):
+                # (counted before, not now: a layer the new tree lost or failed to read is a problem, never "new")
+                problems.append(f"{name}: {layer} counted before, missing now")
+                lines.append(f"| {name} | {layer} | {po['layers'][layer]} | - | missing |")
                 continue
             a, b = int(po["layers"].get(layer, 0)), int(pn["layers"].get(layer, 0))
             pct = (b - a) / a * 100.0 if a else (0.0 if b == 0 else math.inf)

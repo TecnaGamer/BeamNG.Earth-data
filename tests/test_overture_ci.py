@@ -245,5 +245,11 @@ class NewLayerTest(unittest.TestCase):
         self.assertEqual(problems, [])
         self.assertTrue(any("land" in ln and "new" in ln for ln in lines))
 
+    def test_a_layer_counted_before_and_missing_now_fails(self):
+        old = {"places": {"p": {"cells": ["14/1/1"], "layers": {"roads": 100, "land": 5000}}}}
+        new = {"places": {"p": {"cells": ["14/1/1"], "layers": {"roads": 100}}}}
+        lines, problems = ci.compare_counts(["p"], old, new)
+        self.assertEqual(problems, ["p: land counted before, missing now"])
+
 if __name__ == '__main__':
     unittest.main()
