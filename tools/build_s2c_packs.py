@@ -955,10 +955,12 @@ def grid_stack(x, y, tiles, log=None):
         dmin = np.minimum(np.minimum(du, side - du), np.minimum(dv, side - dv))
         wgt = np.clip((dmin * 1024) // int(FEATHER_M * sc), 0, 1024)
         wgt = np.maximum(wgt, 1) * inside
-        geo = TileGeo(rows_u, cols_u, inside, org)
+        pending.append((code, wgt, inside, ids, TileGeo(rows_u, cols_u, inside, org)))
+    # (the stacks' memory taken before any read: packs wait for room rather than run the machine out of memory)
+    _mem_take(sum(len(ids) * geo.n for _, _, _, ids, geo in pending) * STACK_BYTES_PX // (1 << 20))
+    for i, (code, wgt, inside, ids, geo) in enumerate(pending):
         with ThreadPoolExecutor(min(HEAD_THREADS, len(ids))) as ex:     # (headers in parallel; reads submitted)
-            started = list(ex.map(lambda i: start_scene(i, geo), ids))
-        pending.append((code, wgt, inside, ids, geo, started))
+            pending[i] = (code, wgt, inside, ids, geo, list(ex.map(lambda sid: start_scene(sid, geo), ids)))
     # (every tile's reads in flight before the first is decoded)
     out = []
     for code, wgt, inside, ids, geo, started in pending:
@@ -1105,10 +1107,14 @@ SHARP_MARGIN = 5            # (the pack's pixels computed round it: CLARITY_R + 
 def photo_pack(z, px, py, tiles, workers=8, method=None, tone=None, sharpen=None, log=None):
     """Pack (z, px, py) from the scenes: (img (2048, 2048, 3) uint8, valid) or (None, None) when no tile holds it."""
     m = SHARP_MARGIN
-    stack, shape = pack_stack(z, px, py, m, tiles, workers, log)
-    if not stack:
-        return None, None
-    refl, valid = blend(stack, shape, method)
+    try:
+        stack, shape = pack_stack(z, px, py, m, tiles, workers, log)
+        if not stack:
+            return None, None
+        refl, valid = blend(stack, shape, method)
+        del stack
+    finally:
+        _mem_give()
     img = tone_map(refl, valid, tone, sharpen)
     return img[m:-m, m:-m], valid[m:-m, m:-m]
 
@@ -1171,7 +1177,55 @@ def _photo_job(args):
                                      "requests": STATS["requests"] - q0, "peak_mb": peak_mb()}
 
 
-def _worker_init():
+# Memory admission across the worker processes. A pack holds its scenes' stacks (scenes x pixels x 7 bytes: uint16
+# reflectance x 3, a flag byte) from the reads to the blend; at high latitudes ~120 scenes a tile made 4-5 GB packs,
+# and four at once ran 16 GB runners out of memory (the runner killed: "received a shutdown signal"). A pack takes its
+# stacks' size from a budget shared by the processes before it reads and gives it back after the blend; a pack bigger
+# than the whole budget runs alone. This sets only how many packs run at once, never a pack's bytes.
+STACK_BYTES_PX = 9          # (7 bytes a look and pixel, and the fetched bytes and composite temporaries on top)
+_MEM = None                 # (multiprocessing Condition, Value: MB taken by all processes, budget MB) from _worker_init
+_MEM_HELD = 0               # MB this process has taken
+
+
+def mem_budget_mb():
+    """MB the packs' stacks may take at once: 75 % of the memory available now less 1.5 GB (the shard's mosaics, the
+    processes themselves); None without /proc/meminfo (no admission)."""
+    try:
+        with open("/proc/meminfo") as fh:
+            for ln in fh:
+                if ln.startswith("MemAvailable:"):
+                    return max(1, int(ln.split()[1]) // 1024 * 3 // 4 - 1536)
+    except OSError:
+        pass
+    return None
+
+
+def _mem_take(mb):
+    global _MEM_HELD
+    if _MEM is None or mb <= 0:
+        return
+    cond, held, cap = _MEM
+    with cond:
+        while held.value > 0 and held.value + mb > cap:
+            cond.wait()
+        held.value += mb
+    _MEM_HELD += mb
+
+
+def _mem_give():
+    global _MEM_HELD
+    if _MEM is None or not _MEM_HELD:
+        return
+    cond, held, _ = _MEM
+    with cond:
+        held.value -= _MEM_HELD
+        cond.notify_all()
+    _MEM_HELD = 0
+
+
+def _worker_init(mem=None):
+    global _MEM
+    _MEM = mem
     try:
         os.nice(5)
     except (OSError, AttributeError):     # (Windows: no os.nice; start the build with low priority there)
@@ -1530,7 +1584,11 @@ def main():
     if a.workers > 1:
         from concurrent.futures import ProcessPoolExecutor
         import multiprocessing as mp
-        pool = ProcessPoolExecutor(a.workers, mp_context=mp.get_context("spawn"), initializer=_worker_init)
+        ctx = mp.get_context("spawn")
+        budget = mem_budget_mb()
+        mem = None if budget is None else (ctx.Condition(), ctx.Value("q", 0, lock=False), budget)
+        print(f"{a.workers} pack processes, stack budget {budget} MB", flush=True)
+        pool = ProcessPoolExecutor(a.workers, mp_context=ctx, initializer=_worker_init, initargs=(mem,))
     left = 0
     try:
         for x8, y8 in todo:
