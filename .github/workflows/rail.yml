@@ -83,7 +83,16 @@ jobs:
           curl -sfL -o build_lane_tags.py https://raw.githubusercontent.com/TecnaGamer/BeamNG.Earth/dev/tools/build_lane_tags.py
       - name: Build
         run: |
-          python build_lane_tags.py "${{ needs.planet.outputs.url }}" out/lanes
+          # (--xsec: the street tags of the road system's cross-sections, a "xsec" table beside "ways" in each shard:
+          # parking, cycle / bus lanes, shoulders, sidewalks, width:carriageway; BeamNG.Earth's BNE_ROADSYS_XSEC; the
+          # "ways" stay byte for byte as without it)
+          python build_lane_tags.py "${{ needs.planet.outputs.url }}" out/lanes --xsec
+          python3 -I - out/lanes/manifest.json <<'PY'
+          import json, sys
+          m = json.load(open(sys.argv[1]))
+          assert m.get("xsec", 0) > 1000000, m    # (a cut-off stream makes a small table: not published)
+          print("xsec ways:", m["xsec"])
+          PY
           echo "${{ needs.planet.outputs.url }}" > out/lanes/planet.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
         with:

@@ -27,7 +27,10 @@ Built every week from the OpenStreetMap planet by `.github/workflows/rail.yml`, 
 change:lanes, placement, lanes:forward / backward / both_ways, overtaking, divider, lane_markings, width:lanes, bus /
 HOV lanes, ...) by way id. BeamNG.Earth joins them to Overture Maps' road segments (`server/railtags.py` LaneTags) to
 paint the road markings lane by lane and give the traffic the same lanes. Built by the same workflow with
-`tools/build_lane_tags.py`.
+`tools/build_lane_tags.py`. Each shard also holds `"xsec"`: the street tags of every drivable highway way with any of
+them (parking:*, cycleway:*, busway:*, bus:lanes / psv:lanes, shoulder:*, sidewalk:*:width / :kerb, kerb:height,
+width:carriageway, est_width) as one compact table (`keys`, distinct value rows `sets`, delta-coded way `ids`, each
+id's row in `set`), for the road system's cross-sections (`--xsec`).
 
 **License:** the data is © OpenStreetMap contributors, available under the
 [Open Database License 1.0](https://opendatacommons.org/licenses/odbl/1-0/). See
