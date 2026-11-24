@@ -20,6 +20,17 @@
 # full SHA, never a branch). The jobs holding the R2 secrets run nothing but this repo's tools/cip_ci.py (standard
 # library: every file checked against its record's size and SHA-256) and aws-cli.
 #
+# The pin set (2026-11-24: run 45290114494's 333 shards refused once rail.yml published the next week's rail, lanes and
+# OSM tags while they ran): every weekly dataset's build (rail, lanes, stations, signs, FRA, OSM tags / years /
+# colours / areas, tall buildings, regional: their manifests as served) is decided ONCE per build, by the prep job
+# (build_cip --write-pins), and is part of the build id (inputs.data.pins). Every shard job builds with that file
+# (--pins: the pinned builds from their build-addressed folders, data/<name>/<key>/ and <name>/<key>/ parts, never
+# overwritten), so a weekly build landing mid-run changes nothing. The pins job stores it in the bucket first
+# (cip<FORMAT>/<release>/<build>/pins.json, never replaced) with a pointer for the build's code and switches
+# (cip<FORMAT>/<release>/open/<plan key>.json); a later dispatch of the same code, release and switches resumes that
+# build with its own pin set (days later too) until it is published; "build: new" plans a fresh one, "build: <id>"
+# resumes that one or fails. A shard whose pinned build cannot be had fails with exit 4 (its folder gone).
+#
 # Resumable like bnwt.yml: each shard (a contiguous Hilbert run of z10 units) writes its own parts and a record
 # (_build/cells/<N>/<I>.json, uploaded after its parts); later runs skip shards with a record; the index and latest.json
 # are written once every shard is done.
@@ -35,7 +46,9 @@
 #             "all" (the open sea and empty land too: ~229 M of the 268 M cells, most of the build's CPU); a cell left
 #             out is read from its sources by the players, as without CIP
 #   only:     blank: every shard; else shard numbers "744 3477" (a trial)
-#   dry_run:  build only (artifacts kept 3 days), no upload, no index
+#   dry_run:  build only (artifacts kept 3 days), no upload, no index (a fresh pin set, nothing stored)
+#   build:    blank: resume the unpublished build of this code, release and switches (the bucket's pointer), else a
+#             fresh pin set; "new": a fresh pin set (another build of today's weekly data); a build id: resume it
 # Scheduled monthly on the 27th (the day after bnwt.yml) with the defaults.
 # Secrets (repo settings): R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.
 name: cip
@@ -73,6 +86,9 @@ on:
         description: "build only: no upload, no index"
         type: boolean
         default: false
+      build:
+        description: 'blank: resume the build in progress (its pin set), else a new one; "new": a new pin set; or a build id to resume'
+        default: ""
 
 permissions:
   contents: read
@@ -96,7 +112,7 @@ jobs:
       skip: ${{ steps.code.outputs.skip }}
       release: ${{ steps.code.outputs.release }}
       format: ${{ steps.code.outputs.format }}
-      build: ${{ steps.code.outputs.build }}
+      plan_key: ${{ steps.code.outputs.plan_key }}
     steps:
       - id: ref
         name: "The pinned BeamNG.Earth commit"
@@ -139,6 +155,12 @@ jobs:
             echo "::error::the pinned commit's tools/build_cip.py has no --expect-build / --scope: pin a later commit"
             exit 1
           fi
+          # (a builder without the pin set reads each weekly dataset as served when its shard runs: a weekly build
+          # landing mid-run refused every later shard, run 45290114494)
+          if ! grep -q -- '"--pins"' code/tools/build_cip.py || ! grep -q -- '"--write-pins"' code/tools/build_cip.py; then
+            echo "::error::the pinned commit's tools/build_cip.py has no --pins / --write-pins: pin a later commit"
+            exit 1
+          fi
           python -m pip install -q -r code/server/requirements.txt
           (cd code && python tools/build_native.py)
           cd code/server
@@ -164,16 +186,20 @@ jobs:
             code=$(curl -s -o /dev/null -w "%{http_code}" "$CDN/bnwt2/$R/$a.c1.index.json")
             [ "$code" = 200 ] || { echo "::error::BNWT $a of $R not published ($code): run bnwt.yml first"; exit 1; }
           done
-          # (the build id: the inputs as the pinned code reads them, with the weekly builds of today's manifests; --world:
-          # the planet build's layers, as the shards' --world builds hash them; without it the id was another build's and
-          # every shard's output landed under a folder the artifact step did not look in, trial 45072641879)
+          # (a fresh pin set: the inputs as the pinned code reads them, with every weekly dataset's manifest as served
+          # now, and the build id they make; --world: the planet build's layers, as the shards' --world builds hash
+          # them (else another build's folder, trial 45072641879). The pins job resumes the build in progress instead
+          # when there is one of the same plan key: the code and switches without the weekly data.)
           mkdir -p ../../probe
           BNGE_BNWT_URL=$CDN BNGE_OVERTURE_RELEASE=$R python ../tools/build_cip.py --cache ../../probe --out ../../probe/out \
-            --world --scope "$SCOPE" --online --lidar "${LIDAR:-measure}" --inputs-only > ../../probe/inputs.json
+            --world --scope "$SCOPE" --online --lidar "${LIDAR:-measure}" --inputs-only --write-pins ../../probe/pins.json \
+            > ../../probe/inputs.json
           B=$(python3 -c 'import json; print(json.load(open("../../probe/inputs.json"))["build"])')
+          K=$(python3 -c 'import json; print(json.load(open("../../probe/inputs.json"))["plan_key"])')
           python3 -m json.tool ../../probe/inputs.json >> "$GITHUB_STEP_SUMMARY"
-          [[ "$B" =~ ^[0-9a-f]{16}$ ]]
-          echo "build=$B" >> "$GITHUB_OUTPUT"
+          [[ "$B" =~ ^[0-9a-f]{16}$ && "$K" =~ ^[0-9a-f]{16}$ ]]
+          echo "plan_key=$K" >> "$GITHUB_OUTPUT"
+          echo "a fresh pin set would be build $B" | tee -a "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_OUTPUT" | tee -a "$GITHUB_STEP_SUMMARY"
       - if: steps.code.outputs.skip != 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
@@ -182,33 +208,114 @@ jobs:
           path: code/server/earthfast.abi3.so
           retention-days: 7
           if-no-files-found: error
+      - if: steps.code.outputs.skip != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: pins-fresh
+          path: probe/pins.json
+          retention-days: 7
+          if-no-files-found: error
 
-  listing:
-    # (secrets: aws-cli only) what is in the bucket for this build already
+  pins:
+    # (secrets: this repo's standard-library tools/cip_ci.py and aws-cli only) the build and its pin set: the build in
+    # progress of this plan key resumed with its own pins.json, else prep's fresh pin set, stored first (pins.json,
+    # never replaced; then the pointer); and what is in the bucket for the build already
     needs: prep
-    if: ${{ needs.prep.outputs.skip != 'true' && github.event.inputs.dry_run != 'true' }}
+    if: ${{ needs.prep.outputs.skip != 'true' && needs.prep.result == 'success' }}
     runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.pick.outputs.build || steps.dry.outputs.build }}
     steps:
-      - name: The build's keys in the bucket
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: pins-fresh
+          path: fresh
+      - id: dry
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        name: A dry run's pin set (the fresh one; nothing stored)
+        env:
+          RELEASE: ${{ needs.prep.outputs.release }}
+          FORMAT: ${{ needs.prep.outputs.format }}
+          KEY: ${{ needs.prep.outputs.plan_key }}
+        run: |
+          set -euo pipefail
+          mkdir -p out && : > out/listing.txt
+          python3 tools/cip_ci.py pins --fresh fresh/pins.json --release "$RELEASE" --format "$FORMAT" --plan-key "$KEY" \
+            --out out/pins.json > pick.txt
+          B=$(grep '^build=' pick.txt | cut -d= -f2)
+          [[ "$B" =~ ^[0-9a-f]{16}$ ]]
+          echo "build=$B" | tee -a "$GITHUB_OUTPUT" "$GITHUB_STEP_SUMMARY"
+      - id: pick
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        name: The build in progress, or a fresh pin set stored
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (R2 refused aws-cli's default checksums: rail.yml)
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
           R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-          PREFIX: cip${{ needs.prep.outputs.format }}/${{ needs.prep.outputs.release }}/${{ needs.prep.outputs.build }}/
+          RELEASE: ${{ needs.prep.outputs.release }}
+          FORMAT: ${{ needs.prep.outputs.format }}
+          KEY: ${{ needs.prep.outputs.plan_key }}
+          WANT: ${{ github.event.inputs.build }}
         run: |
           set -euo pipefail
-          aws s3 ls "s3://$BUCKET/$PREFIX" --recursive --endpoint-url "$R2" > listing.txt || true
-          echo "$(wc -l < listing.txt) keys under $PREFIX"
+          [[ "$WANT" =~ ^([0-9a-f]{16}|new)?$ ]] || { echo "::error::build must be blank, \"new\" or a build id: $WANT"; exit 1; }
+          [[ "$KEY" =~ ^[0-9a-f]{16}$ && "$RELEASE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\.[0-9]+$ && "$FORMAT" =~ ^[0-9]+$ ]]
+          P="s3://$BUCKET/cip$FORMAT/$RELEASE"
+          CP=(--endpoint-url "$R2" --only-show-errors)
+          B=""; EXPLICIT=0
+          if [[ "$WANT" =~ ^[0-9a-f]{16}$ ]]; then
+            B=$WANT; EXPLICIT=1
+          elif [ "$WANT" != "new" ]; then
+            if aws s3 cp "$P/open/$KEY.json" open.json "${CP[@]}" 2>/dev/null; then B=$(python3 tools/cip_ci.py pointer open.json); fi
+          fi
+          R=()
+          if [ -n "$B" ]; then
+            if aws s3 cp "$P/$B/pins.json" resume.json "${CP[@]}" 2>/dev/null; then R=(--resume resume.json); fi
+            PUB=0
+            if aws s3 ls "$P/$B/cells.index.json" --endpoint-url "$R2" 2>/dev/null | grep -q " cells.index.json$"; then PUB=1; fi
+            R+=(--resume-build "$B" --published "$PUB" --explicit "$EXPLICIT")
+          fi
+          mkdir -p out
+          python3 tools/cip_ci.py pins --fresh fresh/pins.json --release "$RELEASE" --format "$FORMAT" --plan-key "$KEY" \
+            --out out/pins.json "${R[@]}" > pick.txt
+          BUILD=$(grep '^build=' pick.txt | cut -d= -f2)
+          NEW=$(grep '^new=' pick.txt | cut -d= -f2)
+          [[ "$BUILD" =~ ^[0-9a-f]{16}$ && "$NEW" =~ ^(true|false)$ ]]
+          if [ "$NEW" = "true" ]; then
+            # (the build's pin set first, never replaced: its id is the pin set's hash; then the pointer by which the
+            # next run of this code and these switches resumes it)
+            if ! aws s3 ls "$P/$BUILD/pins.json" --endpoint-url "$R2" 2>/dev/null | grep -q " pins.json$"; then
+              aws s3 cp out/pins.json "$P/$BUILD/pins.json" "${CP[@]}" --content-type application/json --cache-control "no-cache"
+            fi
+            printf '{"build":"%s"}\n' "$BUILD" > open.json
+            aws s3 cp open.json "$P/open/$KEY.json" "${CP[@]}" --content-type application/json --cache-control "no-cache"
+          fi
+          # (aws s3 ls exits 1 on an empty prefix: a new build has no keys yet)
+          aws s3 ls "$P/$BUILD/" --recursive --endpoint-url "$R2" > out/listing.txt || true
+          echo "$(wc -l < out/listing.txt) keys under cip$FORMAT/$RELEASE/$BUILD/" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "build=$BUILD (new pin set: $NEW)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: pins
+          path: out/pins.json
+          retention-days: 7
+          if-no-files-found: error
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
         with:
           name: listing
-          path: listing.txt
+          path: out/listing.txt
           retention-days: 7
 
   plan:
-    needs: [prep, listing]
-    if: ${{ !cancelled() && needs.prep.outputs.skip != 'true' && needs.prep.result == 'success' && needs.listing.result != 'failure' }}
+    needs: [prep, pins]
+    if: ${{ !cancelled() && needs.prep.outputs.skip != 'true' && needs.pins.result == 'success' }}
     runs-on: ubuntu-latest
     outputs:
       entries: ${{ steps.plan.outputs.entries }}
@@ -216,29 +323,28 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
         with:
           persist-credentials: false
-      - if: ${{ needs.listing.result == 'success' }}
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
         with:
           name: listing
       - id: plan
         env:
           RELEASE: ${{ needs.prep.outputs.release }}
           FORMAT: ${{ needs.prep.outputs.format }}
-          BUILD: ${{ needs.prep.outputs.build }}
+          BUILD: ${{ needs.pins.outputs.build }}
           SHARDS: ${{ github.event.inputs.shards || '4096' }}
           JOBS: ${{ github.event.inputs.jobs || '200' }}
           ONLY: ${{ github.event.inputs.only }}
         run: |
           set -euo pipefail
           [[ "$SHARDS" =~ ^[0-9]+$ && "$JOBS" =~ ^[0-9]+$ && "$ONLY" =~ ^[0-9\ ]*$ ]]
-          L=(); [ -f listing.txt ] && L=(--listing listing.txt)
+          L=(); [ -s listing.txt ] && L=(--listing listing.txt)
           python3 tools/cip_ci.py plan --release "$RELEASE" --format "$FORMAT" --build "$BUILD" --shards "$SHARDS" \
             --jobs "$JOBS" --only "$ONLY" "${L[@]}" 2> plan.log > plan.json
           cat plan.log | tee -a "$GITHUB_STEP_SUMMARY"
           python3 -c 'import json; print("entries=" + json.dumps(json.load(open("plan.json"))["entries"], separators=(",", ":")))' >> "$GITHUB_OUTPUT"
 
   shards:
-    needs: [prep, plan]
+    needs: [prep, pins, plan]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.entries != '[]' }}
     strategy:
       fail-fast: false
@@ -256,7 +362,7 @@ jobs:
       sha: ${{ needs.prep.outputs.sha }}
       release: ${{ needs.prep.outputs.release }}
       format: ${{ needs.prep.outputs.format }}
-      build: ${{ needs.prep.outputs.build }}
+      build: ${{ needs.pins.outputs.build }}
       lidar: ${{ github.event.inputs.lidar || 'measure' }}
       scope: ${{ github.event.inputs.scope || 'content' }}
       workers: ${{ github.event.inputs.workers || '4' }}
@@ -268,8 +374,8 @@ jobs:
 
   records:
     # (secrets: aws-cli only) every shard record of the build, for its index
-    needs: [prep, shards]
-    if: ${{ !cancelled() && needs.prep.outputs.skip != 'true' && needs.prep.result == 'success' && github.event.inputs.dry_run != 'true' }}
+    needs: [prep, pins, shards]
+    if: ${{ !cancelled() && needs.prep.outputs.skip != 'true' && needs.pins.result == 'success' && github.event.inputs.dry_run != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: The records and the build's listing
@@ -278,7 +384,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-          PREFIX: cip${{ needs.prep.outputs.format }}/${{ needs.prep.outputs.release }}/${{ needs.prep.outputs.build }}
+          PREFIX: cip${{ needs.prep.outputs.format }}/${{ needs.prep.outputs.release }}/${{ needs.pins.outputs.build }}
           SHARDS: ${{ github.event.inputs.shards || '4096' }}
         run: |
           set -euo pipefail
@@ -296,7 +402,7 @@ jobs:
 
   assemble:
     # (no secrets: the pinned code writes the index, the airports snapshot and latest.json from the records)
-    needs: [prep, records]
+    needs: [prep, pins, records]
     if: ${{ !cancelled() && needs.records.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -320,12 +426,16 @@ jobs:
         with:
           name: records
           path: rec
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: pins
+          path: pins
       - name: Index, airports and attribution once every shard is done
         id: index
         env:
           RELEASE: ${{ needs.prep.outputs.release }}
           FORMAT: ${{ needs.prep.outputs.format }}
-          BUILD: ${{ needs.prep.outputs.build }}
+          BUILD: ${{ needs.pins.outputs.build }}
           SHARDS: ${{ github.event.inputs.shards || '4096' }}
           LIDAR: ${{ github.event.inputs.lidar || 'measure' }}
           SCOPE: ${{ github.event.inputs.scope || 'content' }}
@@ -340,7 +450,7 @@ jobs:
           if grep -q " cip$FORMAT/$RELEASE/$BUILD/cells.index.json$" rec/listing.txt; then echo "published already"; exit 0; fi
           echo "ready=true" >> "$GITHUB_OUTPUT"
           BNGE_BNWT_URL=$CDN BNGE_OVERTURE_RELEASE=$RELEASE python code/tools/build_cip.py --cache cache --out rec \
-            --world --scope "$SCOPE" --online --lidar "$LIDAR" --work work --assemble --from-shards "$SHARDS" --expect-build "$BUILD" \
+            --world --scope "$SCOPE" --online --lidar "$LIDAR" --work work --assemble --from-shards "$SHARDS" --expect-build "$BUILD" --pins pins/pins.json \
             | tee -a "$GITHUB_STEP_SUMMARY"
           cp "$D/cells.index.json" "$D/ATTRIBUTION.txt" "$D"/airports.csv.gz "$D"/runways.csv.gz pub/
           cp "rec/cip$FORMAT/$RELEASE/latest.json" pub/
@@ -355,7 +465,7 @@ jobs:
 
   publish:
     # (secrets: this repo's checker and aws-cli only) the index once every part is in the bucket, latest.json LAST
-    needs: [prep, assemble]
+    needs: [prep, pins, assemble]
     # (only once the assemble step wrote the index: a partial run, or one already published, has nothing to publish)
     if: ${{ !cancelled() && needs.assemble.result == 'success' && needs.assemble.outputs.ready == 'true' }}
     runs-on: ubuntu-latest
@@ -375,7 +485,7 @@ jobs:
           R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
           RELEASE: ${{ needs.prep.outputs.release }}
           FORMAT: ${{ needs.prep.outputs.format }}
-          BUILD: ${{ needs.prep.outputs.build }}
+          BUILD: ${{ needs.pins.outputs.build }}
         run: |
           set -euo pipefail
           if [ ! -f in/pub/cells.index.json ]; then echo "the build is not complete in this run"; exit 0; fi

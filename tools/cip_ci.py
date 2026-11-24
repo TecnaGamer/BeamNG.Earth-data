@@ -13,6 +13,16 @@ bnwt_ci.py's checks for the CIP layout: one archive "cells" per build, under cip
         and format, its parts on hand with the sizes and SHA-256s it gives, each under 512 MB (the CDN caches files
         up to 512 MB whole) and starting with a PMTiles v3 header. Moves the accepted shards' files to STAGE/parts and
         STAGE/records (a shard is uploaded whole or not at all).
+    cip_ci.py pointer OPEN.json
+        the build a plan pointer (cip<FORMAT>/<release>/open/<plan key>.json, {"build": B}) names, or nothing.
+    cip_ci.py pins --fresh FRESH.json --release R --format F --plan-key K --out PINS.json
+                   [--resume RESUME.json --resume-build B --published 0|1 --explicit 0|1]
+        the build's pin set (build_cip --write-pins: every weekly dataset's manifest, the inputs and the build id):
+        the resumed build's (its pins.json from the bucket) when it is of the same code and switches as this run's
+        fresh plan (FRESH, made by the pinned code) and not published yet, else (or none to resume) the fresh one.
+        Each checked: the build id the SHA-256 of its inputs, its inputs' pins the SHA-256s of its manifests, this
+        release and format. --explicit 1 (the dispatch named the build): anything but resuming it is an error.
+        Prints build=<id> and new=true|false (new: its pins.json and the pointer are uploaded by the caller).
     cip_ci.py published DIR --release R --format F --build B --listing L.txt
         build_cip --assemble's output (cells.index.json, the airports snapshot, ATTRIBUTION.txt, latest.json) checked
         before it is published: every part the index names is in the bucket's listing with its size, ids in order, the
@@ -63,6 +73,109 @@ def plan(a):
     n = max(1, min(len(todo), a.jobs, 250)) if todo else 0
     entries = [{"id": f"cells-{j:03d}", "shards": " ".join(map(str, todo[j::n]))} for j in range(n)]
     print(json.dumps({"entries": entries}, separators=(",", ":")))
+
+
+# inputs.data's parts that name weekly data builds (BeamNG.Earth tools/build_cip.py PIN_KEYS): two builds that differ
+# only there are the same code and switches
+PIN_KEYS = ("rails", "lanes", "osmtags", "stations", "pins")
+MAX_PINS = 8 * 1000 * 1000
+
+
+def build_id(inputs):
+    """BeamNG.Earth server/cip.build_id: the hash of the whole inputs document."""
+    return hashlib.sha256(json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+
+
+def load_pins(path, release, fmt):
+    """A pin set document, checked (raises ValueError)."""
+    if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) > MAX_PINS:
+        raise ValueError(f"{path}: not a pin set file")
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+    if not isinstance(doc, dict) or doc.get("format") != 1:
+        raise ValueError("not a pin set of format 1")
+    b, inputs, ds = doc.get("build"), doc.get("inputs"), doc.get("datasets")
+    if not isinstance(b, str) or not BUILD_RE.fullmatch(b) or not isinstance(inputs, dict) or not isinstance(ds, dict):
+        raise ValueError("no build, inputs or datasets")
+    if build_id(inputs) != b:
+        raise ValueError(f"build {b} is not its inputs' ({build_id(inputs)})")
+    code, data = inputs.get("code"), inputs.get("data")
+    if not isinstance(code, dict) or not isinstance(data, dict) or code.get("overture") != release \
+            or not isinstance(code.get("cip"), list) or code["cip"][:1] != [fmt]:
+        raise ValueError(f"inputs of another release or format ({code.get('overture') if isinstance(code, dict) else None})")
+    pins = data.get("pins")
+    if not isinstance(pins, dict):
+        raise ValueError("its inputs pin no weekly data")
+    names = {}
+    for ident, body in ds.items():
+        if not isinstance(ident, str) or "|" not in ident or (body is not None and not isinstance(body, str)):
+            raise ValueError(f"dataset {ident!r}")
+        name = ident.split("|", 1)[0]
+        if name in names:
+            raise ValueError(f"two datasets named {name}")
+        names[name] = body
+    if set(names) != set(pins):
+        raise ValueError(f"datasets {sorted(names)} vs the inputs' pins {sorted(pins)}")
+    for name, body in names.items():
+        p = pins[name]
+        if body is None:
+            if p is not None:
+                raise ValueError(f"{name}: pinned without a manifest")
+            continue
+        if not isinstance(json.loads(body), dict) or not isinstance(p, dict) \
+                or p.get("sha256") != hashlib.sha256(body.encode("utf-8")).hexdigest():
+            raise ValueError(f"{name}: its manifest is not the one the inputs pin")
+    return doc
+
+
+def same_settings(a, b):
+    """Are pin sets a and b of the same code and switches (their inputs alike but for the weekly data)?"""
+    def cut(doc):
+        i = doc["inputs"]
+        return {"code": i["code"], "data": {k: v for k, v in i["data"].items() if k not in PIN_KEYS}}
+    return cut(a) == cut(b)
+
+
+def pointer(a):
+    try:
+        if os.path.islink(a.file) or os.path.getsize(a.file) > 4096:
+            return
+        with open(a.file, encoding="utf-8") as f:
+            got = json.load(f)
+    except (OSError, ValueError):
+        return
+    b = got.get("build") if isinstance(got, dict) else None
+    if isinstance(b, str) and BUILD_RE.fullmatch(b):
+        print(b)
+
+
+def pins(a):
+    fresh = load_pins(a.fresh, a.release, a.format)
+    if not BUILD_RE.fullmatch(a.plan_key) or fresh.get("plan_key") != a.plan_key:
+        raise SystemExit(f"the fresh pin set is of plan key {fresh.get('plan_key')!r}, not {a.plan_key!r}")
+    chosen, src, why = fresh, a.fresh, "no build in progress: a fresh pin set"
+    if a.resume_build:
+        if not BUILD_RE.fullmatch(a.resume_build):
+            raise SystemExit(f"bad build {a.resume_build!r}")
+        try:
+            got = load_pins(a.resume, a.release, a.format) if a.resume else None
+            if got is None:
+                raise ValueError("no pins.json in the bucket")
+            if got["build"] != a.resume_build:
+                raise ValueError(f"its pins.json is of build {got['build']}")
+            if not same_settings(got, fresh):
+                raise ValueError("of other code or switches than this run's")
+            if a.published:
+                raise ValueError("published already")
+            chosen, src, why = got, a.resume, f"resuming build {a.resume_build} (its pin set)"
+        except (OSError, ValueError) as e:
+            if a.explicit:
+                raise SystemExit(f"build {a.resume_build}: {e}")
+            why = f"build {a.resume_build} not resumed ({e}): a fresh pin set"
+    print(why, file=sys.stderr)
+    shutil.copyfile(src, a.out)
+    print(f"build={chosen['build']}")
+    print(f"new={'true' if chosen is fresh else 'false'}")
 
 
 def sha256(path):
@@ -193,6 +306,18 @@ def main():
     c.add_argument("--release", required=True)
     c.add_argument("--build", required=True)
     c.add_argument("--format", type=int, required=True)
+    o = sub.add_parser("pointer")
+    o.add_argument("file")
+    n = sub.add_parser("pins")
+    n.add_argument("--fresh", required=True)
+    n.add_argument("--release", required=True)
+    n.add_argument("--format", type=int, required=True)
+    n.add_argument("--plan-key", required=True)
+    n.add_argument("--out", required=True)
+    n.add_argument("--resume")
+    n.add_argument("--resume-build", default="")
+    n.add_argument("--published", type=int, default=0)
+    n.add_argument("--explicit", type=int, default=0)
     q = sub.add_parser("published")
     q.add_argument("dir")
     q.add_argument("--release", required=True)
@@ -202,6 +327,13 @@ def main():
     a = ap.parse_args()
     if getattr(a, "release", None) is not None and not RELEASE_RE.fullmatch(a.release):
         raise SystemExit(f"bad release {a.release!r}")
+    if a.cmd == "pointer":
+        return pointer(a)
+    if a.cmd == "pins":
+        try:
+            return pins(a)
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"pins: {type(e).__name__}: {e}")
     if not BUILD_RE.fullmatch(a.build):
         raise SystemExit(f"bad build {a.build!r}")
     if a.cmd == "plan":

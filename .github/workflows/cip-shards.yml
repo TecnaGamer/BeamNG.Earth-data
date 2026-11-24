@@ -2,9 +2,10 @@
 # the bucket as soon as it is built (artifacts never hold more than ~20 jobs' output at once).
 #   build:  NO secrets. BeamNG.Earth's tools/build_cip.py at the pinned commit builds the entry's shards one after the
 #           other (each with a fresh source cache: a runner's disk holds one shard's sources; Overture through the
-#           release's BNWT archives on the CDN), none started after the time budget; a shard whose weekly data builds
-#           are not the build's own (a weekly run landed meanwhile) fails and is built by the next run of the same build
-#           id; the finished shards' parts and records become an artifact.
+#           release's BNWT archives on the CDN), none started after the time budget, every one with the build's pin
+#           set (the calling run's "pins" artifact, build_cip --pins: the weekly datasets' builds decided when the
+#           build was planned, read from their build-addressed folders, whatever Pages serves now; exit 4: a pinned
+#           build's files cannot be had); the finished shards' parts and records become an artifact.
 #   upload: the R2 secrets; runs only this repo's tools/cip_ci.py check (every file named as a part or record of this
 #           build, its size and SHA-256 as its record says; anything else rejects the whole artifact) and aws-cli:
 #           the parts first, the records (the shards' done markers) after them; then deletes the artifact.
@@ -64,6 +65,17 @@ jobs:
         with:
           name: earthfast
           path: code/server
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: pins
+          path: pins
+      - name: The build's pin set
+        env:
+          BUILD: ${{ inputs.build }}
+        run: |
+          set -euo pipefail
+          python3 -c 'import json, sys; d = json.load(open("pins/pins.json")); sys.exit(0 if d.get("build") == sys.argv[1] else "the pin set is of build " + str(d.get("build")))' "$BUILD"
+          echo "PINS=$PWD/pins/pins.json" >> "$GITHUB_ENV"
       - name: Packages and room on the runner
         run: |
           python -m pip install -q -r code/server/requirements.txt
@@ -98,18 +110,20 @@ jobs:
           for i in $SHARDS; do
             if [ "$(date +%s)" -gt "$DEADLINE" ]; then left=$((left + 1)); continue; fi
             t0=$(date +%s)
-            # (one run: the builder computes the build id from its own inputs (the --world layers) and refuses with
-            # exit 3 when it is not $BUILD (a weekly data build landed since the plan); its output then lands exactly
-            # under $D/out/cip$FORMAT/$RELEASE/$BUILD/, the artifact's path)
+            # (one run: the builder computes the build id from its own inputs (the --world layers, the pin set's weekly
+            # builds) and refuses with exit 3 when it is not $BUILD (other code or switches than the plan's); its output
+            # then lands exactly under $D/out/cip$FORMAT/$RELEASE/$BUILD/, the artifact's path)
             rc=0
             python code/tools/build_cip.py --cache "$D/cache" --out "$D/out" --work "$D/work" --online --world \
               --scope "$SCOPE" --lidar "$LIDAR" --jobs "$WORKERS" --shard "$i/$OF" --shard-parts --expect-build "$BUILD" \
-              > "$D/shard.json" || rc=$?
+              --pins "$PINS" > "$D/shard.json" || rc=$?
             cat "$D/shard.json" || true
             if [ "$rc" -eq 0 ]; then
               ok=$((ok + 1))
             elif [ "$rc" -eq 3 ]; then
-              failed=$((failed + 1)); echo "::warning::shard $i/$OF: the inputs are another build now, not $BUILD (a weekly build landed)"
+              failed=$((failed + 1)); echo "::error::shard $i/$OF: the inputs are another build, not $BUILD (other code or switches than the plan's)"
+            elif [ "$rc" -eq 4 ]; then
+              failed=$((failed + 1)); echo "::error::shard $i/$OF: a pinned weekly build of $BUILD cannot be had (its build-addressed folder; see the log)"
             else
               failed=$((failed + 1)); echo "::warning::shard $i/$OF failed ($rc)"
             fi
