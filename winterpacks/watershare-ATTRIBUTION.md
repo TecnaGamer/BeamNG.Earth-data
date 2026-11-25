@@ -10,5 +10,6 @@ https://global-surface-water.appspot.com/
 
 "All data here is produced under the Copernicus Programme and is provided free of charge, without restriction of use"
 (the provider's download page, https://global-surface-water.appspot.com/download, which names the Copernicus
-Regulation for the full licence terms). Products using the data credit the dataset and the journal article above. This pack is a modified, condensed product;
-errors in it are BeamNG.Earth's, not the European Commission's or Google's.
+Regulation for the full licence terms). Products using the data credit the dataset and the journal article above.
+This pack is a modified, condensed product; errors in it are BeamNG.Earth's, not the European Commission's or
+Google's.
