@@ -11,6 +11,9 @@ decodes an image beyond its PNG chunk structure.
   watershare/<version>/<x>/<y>.png      JRC Global Surface Water -> water share, 0.004 degrees, 2-degree shards
   watershare/<version>/ATTRIBUTION.md
   watershare/<version>/manifest.json    uploaded LAST
+  nbiskew/<version>/nbiskew.npz         the US National Bridge Inventory's skews (items 16, 17, 34, 49), one npz
+  nbiskew/<version>/ATTRIBUTION.md      (tools/build_nbiskew.py: lat, lon float32, skew uint8, length uint16)
+  nbiskew/<version>/manifest.json       uploaded LAST
 
 Players' servers read a pack only once cdn.json has {"<pack>": {"enabled": true, "version": "<version>"}} (a hand
 commit after the live check, last). A published version is never overwritten: a version whose manifest.json is in the
@@ -19,7 +22,9 @@ bucket is only compared (state=published); a change needs a new version. Nothing
   check ART PACK          ART/PACK holds exactly manifest.json, ATTRIBUTION.md and the files the manifest names (no
                           links, no other files or folders, plain names); every file a well-formed PNG (signature,
                           chunk CRCs, IHDR the pack's size / bit depth / colour type, IEND last) with the manifest's size
-                          and SHA-256; the manifest's fields as the pack's format says; watershare: at least --min shards
+                          and SHA-256; the manifest's fields as the pack's format says; watershare: at least --min shards;
+                          nbiskew: the npz a plain zip of exactly lat / lon / skew / length .npy members (no pickles,
+                          their headers the columns' dtypes, each the manifest's record count, sizes that add up)
   todo ART PACK --listing L [--complete]
                           L: aws s3api list-objects-v2 of PACK/<version>/. Refuses a key there that is not one of the
                           pack's files, or one with another size (a published folder is never overwritten); prints
@@ -51,7 +56,12 @@ import zlib
 PACKS = {
     "leaftype": {"width": 7200, "height": 3600, "colour": 4, "single": "leaftype.png", "min": 1},
     "watershare": {"width": 500, "height": 500, "colour": 0, "single": None, "min": 3000},
+    "nbiskew": {"single": "nbiskew.npz", "min": 1},
 }
+NBI_COLUMNS = {"lat": "<f4", "lon": "<f4", "skew": "|u1", "length": "<u2"}
+NBI_MIN_RECORDS = 100000
+CREDIT = {"leaftype": ("Copernicus", "Land Cover CCI"), "watershare": ("Copernicus", "Land Cover CCI"),
+          "nbiskew": ("National Bridge Inventory",)}
 VERSION_RE = re.compile(r"v[1-9][0-9]{0,3}")
 SHARD_RE = re.compile(r"(\d{1,3})/(\d{1,2})\.png")
 HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -120,6 +130,37 @@ def png_check(path, prof):
         refuse(f"{path}: no IDAT or IEND")
 
 
+def npz_check(path, records):
+    """A table npz (nbiskew): a plain zip of exactly the NBI_COLUMNS' .npy members, stored or deflated, each a
+    version 1.0 .npy whose header is the column's dtype, C order, shape (records,), its uncompressed size the header
+    plus records x the item size. Standard library only: the zip's own directory, the headers parsed as literals."""
+    import ast
+    import zipfile
+    with zipfile.ZipFile(path) as z:
+        infos = z.infolist()
+        names = sorted(i.filename for i in infos)
+        if names != sorted(k + ".npy" for k in NBI_COLUMNS):
+            refuse(f"{path}: members {names}")
+        for i in infos:
+            if i.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED) or i.flag_bits & 0x1:
+                refuse(f"{i.filename}: compression / encryption")
+            col = i.filename[:-4]
+            itemsize = int(NBI_COLUMNS[col][2:])
+            with z.open(i) as f:
+                head = f.read(10)
+                if head[:8] != b"\x93NUMPY\x01\x00":
+                    refuse(f"{i.filename}: not a .npy 1.0")
+                hl = struct.unpack("<H", head[8:10])[0]
+                if hl > 4096:
+                    refuse(f"{i.filename}: header too long")
+                d = ast.literal_eval(f.read(hl).decode("latin-1"))
+            if not isinstance(d, dict) or d.get("descr") != NBI_COLUMNS[col] or d.get("fortran_order") is not False \
+                    or d.get("shape") != (records,):
+                refuse(f"{i.filename}: header {d!r}, not {NBI_COLUMNS[col]} ({records},)")
+            if i.file_size != 10 + hl + records * itemsize:
+                refuse(f"{i.filename}: {i.file_size} bytes uncompressed")
+
+
 def walk(root):
     """{relative path: size} of every regular file under root; refuses links and special files."""
     out = {}
@@ -162,7 +203,17 @@ def load_manifest(root, pack):
 def files_of(m, pack):
     """{relative path: (size, sha256)} the manifest names."""
     out = {}
-    if pack == "leaftype":
+    if pack == "nbiskew":
+        fl = m.get("files")
+        if not isinstance(fl, list) or len(fl) != 1 or not isinstance(fl[0], dict) or \
+                fl[0].get("path") != PACKS[pack]["single"]:
+            refuse("manifest: files")
+        out[fl[0]["path"]] = (fl[0].get("size"), fl[0].get("sha256"))
+        n = m.get("records")
+        if not isinstance(n, int) or isinstance(n, bool) or not NBI_MIN_RECORDS <= n <= 2_000_000 or \
+                m.get("columns") != NBI_COLUMNS or m.get("varies") != 99:
+            refuse(f"manifest: records / columns {n!r}")
+    elif pack == "leaftype":
         fl = m.get("files")
         if not isinstance(fl, list) or len(fl) != 1 or not isinstance(fl[0], dict) or \
                 fl[0].get("path") != PACKS[pack]["single"]:
@@ -210,7 +261,7 @@ def cmd_check(a):
         refuse(f"{pack}: extra {sorted(extra)[:5]}, missing {sorted(missing)[:5]}")
     with open(os.path.join(root, "ATTRIBUTION.md"), encoding="utf-8") as f:
         att = f.read()
-    if len(att) < 200 or ("Copernicus" not in att and "Land Cover CCI" not in att):
+    if len(att) < 200 or not any(c in att for c in CREDIT[pack]):
         refuse("ATTRIBUTION.md: too short or without the source's credit")
     if pack == "watershare" and len(want) < a.min:
         refuse(f"watershare: {len(want)} shards, fewer than {a.min} (a cut-off build?)")
@@ -219,7 +270,10 @@ def cmd_check(a):
         size, sha = want[p]
         if have[p] != size:
             refuse(f"{p}: {have[p]} bytes, the manifest says {size}")
-        png_check(os.path.join(root, p), prof)
+        if pack == "nbiskew":
+            npz_check(os.path.join(root, p), m["records"])
+        else:
+            png_check(os.path.join(root, p), prof)
         if sha256_file(os.path.join(root, p)) != sha:
             refuse(f"{p}: SHA-256")
         total += size

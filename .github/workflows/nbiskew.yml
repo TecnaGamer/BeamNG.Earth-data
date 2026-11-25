@@ -1,0 +1,165 @@
+# BeamNG.Earth's bridge skew table on the project's tile host (Cloudflare R2 bnge-tiles behind tiles.tgforever.net;
+# README-nbiskew.md):
+#   nbiskew/<version>/   the US National Bridge Inventory's skew (item 34) and structure length (item 49) at every
+#                        structure's coordinates (items 16 / 17), one npz (tools/build_nbiskew.py; source: FHWA's
+#                        delimited files of every state, only from www.fhwa.dot.gov, public domain)
+# Manual only: Actions -> nbiskew -> Run workflow. Players read it only once cdn.json (this repo) has
+# {"nbiskew": {"enabled": true, "version": "<version>"}}, a hand commit after the live check (last).
+#
+#   build    [no secrets] FHWA's archive downloaded (its host checked), the table built with pinned numpy, staged
+#            (manifest.json with the file's size and SHA-256, ATTRIBUTION.md), built a second time and byte-compared
+#            (deterministic), checked by tools/winterpack_ci.py; the staged folder as the artifact nbiskew-build
+#   publish  [R2 secrets: this repo's stdlib checker and aws-cli only; main only; not on dry runs] the artifact checked
+#            again, nbiskew/<version>/ listed (a key not of the table, or one with another size, refuses: a published
+#            version is never rewritten), the files not there yet uploaded (immutable), the listing checked, manifest.json
+#            last
+#   live     [no secrets] manifest.json and the table fetched through the CDN, byte-compared
+# Inputs: version (v1, v2, ...), year (the NBI's file year, 2025), dry_run (default true: build and check only).
+# Secrets (repo settings): R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.
+name: nbiskew
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "table version: v1, v2, ... (never one published before with other files)"
+        default: "v1"
+      year:
+        description: "the NBI file year (https://www.fhwa.dot.gov/bridge/nbi/<year>hwybronefiledel.zip)"
+        default: "2025"
+      dry_run:
+        description: "build and check only: no upload"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nbiskew
+  cancel-in-progress: false
+
+env:
+  BUCKET: bnge-tiles
+  CDN: https://tiles.tgforever.net
+  NP: "2.3.4"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: "Inputs"
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+          YEAR: ${{ github.event.inputs.year }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^v[1-9][0-9]{0,3}$ ]] || { echo "::error::bad version: $VERSION"; exit 1; }
+          [[ "$YEAR" =~ ^20[2-9][0-9]$ ]] || { echo "::error::bad year: $YEAR"; exit 1; }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q "numpy==$NP"
+      - name: "FHWA's NBI archive, the table, built twice, staged and checked"
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+          YEAR: ${{ github.event.inputs.year }}
+        run: |
+          set -euo pipefail
+          mkdir -p src art/nbiskew
+          python tools/build_nbiskew.py fetch src/nbi.zip --year "$YEAR"
+          python tools/build_nbiskew.py build src/nbi.zip build --version "$VERSION" --year "$YEAR" | tee -a "$GITHUB_STEP_SUMMARY"
+          python tools/build_nbiskew.py build src/nbi.zip build2 --version "$VERSION" --year "$YEAR" > /dev/null
+          cmp build/nbiskew.npz build2/nbiskew.npz || { echo "::error::two builds differ"; exit 1; }
+          cp build/nbiskew.npz build/manifest.json art/nbiskew/
+          cp winterpacks/nbiskew-ATTRIBUTION.md art/nbiskew/ATTRIBUTION.md
+          python3 -I tools/winterpack_ci.py check art nbiskew | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: nbiskew-build
+          path: art
+          retention-days: 30
+
+  publish:
+    needs: build
+    if: ${{ !cancelled() && github.event.inputs.dry_run != 'true' && github.ref == 'refs/heads/main' && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (R2 and aws-cli 2.23+'s default checksums: rail.yml)
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: nbiskew-build
+          path: art
+      - name: "Checked again, the version's keys listed, the files uploaded, the manifest last"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          PACK=nbiskew
+          chk() { python3 -I tools/winterpack_ci.py "$@"; }
+          chk check art "$PACK" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$(chk key art "$PACK")" = "$VERSION" ] || { echo "::error::the artifact is not version $VERSION"; exit 1; }
+          P="$PACK/$VERSION"
+          # (list-objects-v2 exits 0 on an empty prefix and non-zero on an auth / network error: no silent "not there")
+          aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$P/" --endpoint-url "$R2" --output json > before.json
+          chk todo art "$PACK" --version "$VERSION" --listing before.json > todo.txt
+          echo "$(wc -l < todo.txt) files to upload to $P" | tee -a "$GITHUB_STEP_SUMMARY"
+          while read -r f k; do
+            # (the names come from the checked manifest, never from a listing of the artifact)
+            [[ "$f" =~ ^art/$PACK/(nbiskew\.npz|ATTRIBUTION\.md)$ && "$k" == "$P/${f#art/$PACK/}" ]] \
+              || { echo "::error::bad upload line: $f $k"; exit 1; }
+            case "$f" in *.md) ct="text/markdown; charset=utf-8";; *) ct=application/octet-stream;; esac
+            for try in 1 2 3; do
+              aws s3 cp "$f" "s3://$BUCKET/$k" --endpoint-url "$R2" --only-show-errors \
+                --content-type "$ct" --cache-control "public, max-age=31536000, immutable" < /dev/null && break
+              test "$try" -lt 3; sleep $((try * 20))
+            done
+          done < todo.txt
+          aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$P/" --endpoint-url "$R2" --output json > after.json
+          STATE=$(chk todo art "$PACK" --version "$VERSION" --listing after.json --complete)
+          if [ "$STATE" = "published" ]; then
+            echo "$P: published before (manifest there with the same size): not written again" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            aws s3 cp "art/$PACK/manifest.json" "s3://$BUCKET/$P/manifest.json" --endpoint-url "$R2" --only-show-errors \
+              --content-type application/json --cache-control "public, max-age=86400" < /dev/null
+            echo "$P: every file uploaded, manifest.json last" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+  live:
+    needs: publish
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: nbiskew-build
+          path: art
+      - name: "Through the CDN: the manifest and the table, byte for byte"
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          python3 -I tools/winterpack_ci.py live art nbiskew --base "$CDN/nbiskew/$VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
+          {
+            echo ""
+            echo "Players read it once cdn.json names it (a commit to main, by hand, last):"
+            echo ""
+            echo "    python3 -I tools/winterpack_ci.py cdn-key cdn.json nbiskew $VERSION && git commit -m \"cdn.json: nbiskew $VERSION\" cdn.json"
+          } >> "$GITHUB_STEP_SUMMARY"
