@@ -1,0 +1,293 @@
+# BeamNG.Earth's two static raster packs for the winter white ground (W2) and bare winter trees (W4), on the project's
+# tile host (Cloudflare R2 bnge-tiles behind tiles.tgforever.net; README-winterpacks.md):
+#   leaftype/<version>/    ESA CCI Land Cover 2015 (300 m) -> evergreen share of the trees + tree cover, 0.05 deg, one
+#                          PNG (tools/build_leaftype_pack.py; source on CEDA's open archive, no account)
+#   watershare/<version>/  JRC Global Surface Water v1.5 occurrence (30 m) -> water share, 0.004 deg, 2-degree PNG
+#                          shards (tools/build_water_pack.py; source on the provider's open S3 listing, no account)
+# Manual only: Actions -> winterpacks -> Run workflow. Players read a pack only once cdn.json (this repo) has
+# {"<pack>": {"enabled": true, "version": "<version>"}}, a hand commit after the live check (last).
+#
+#   leaftype / watershare_plan + watershare_build (matrix) + watershare_gather   [no secrets] the source downloaded, the
+#            pack built with pinned numpy / Pillow / rasterio, staged (manifest.json with every file's size and SHA-256,
+#            ATTRIBUTION.md) and checked by tools/winterpack_ci.py; the staged folder as the artifact <pack>-build
+#   publish  [R2 secrets: this repo's stdlib checker and aws-cli only; main only; not on dry runs] the artifact checked
+#            again, <pack>/<version>/ listed (a key not of the pack, or one with another size, refuses: a published
+#            version is never rewritten), the files not there yet uploaded (immutable), the listing checked for every
+#            file, manifest.json last
+#   live     [no secrets] manifest.json and a sample of the files fetched through the CDN, byte-compared
+# Inputs: pack (leaftype / watershare), version (v1, v2, ...), tiles (watershare: blank = every source tile, else names
+# such as "100W_50N 80W_50N" for a trial: a trial never publishes, its minimum shard count fails), dry_run (default
+# true: build and check only).
+# Secrets (repo settings): R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.
+name: winterpacks
+
+on:
+  workflow_dispatch:
+    inputs:
+      pack:
+        description: "leaftype or watershare"
+        default: "leaftype"
+      version:
+        description: "pack version: v1, v2, ... (never one published before with other files)"
+        default: "v1"
+      tiles:
+        description: 'watershare: blank for every source tile, else "100W_50N 80W_50N" (a trial: never published)'
+        default: ""
+      dry_run:
+        description: "build and check only: no upload"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: winterpacks-${{ github.event.inputs.pack }}
+  cancel-in-progress: false
+
+env:
+  BUCKET: bnge-tiles
+  CDN: https://tiles.tgforever.net
+  NP: "2.3.4"
+  PL: "13.0.0"
+  RIO: "1.5.2"
+
+jobs:
+  inputs:
+    runs-on: ubuntu-latest
+    outputs:
+      pack: ${{ steps.v.outputs.pack }}
+    steps:
+      - id: v
+        env:
+          PACK: ${{ github.event.inputs.pack }}
+          VERSION: ${{ github.event.inputs.version }}
+          TILES: ${{ github.event.inputs.tiles }}
+        run: |
+          set -euo pipefail
+          [[ "$PACK" =~ ^(leaftype|watershare)$ ]] || { echo "::error::bad pack: $PACK"; exit 1; }
+          [[ "$VERSION" =~ ^v[1-9][0-9]{0,3}$ ]] || { echo "::error::bad version: $VERSION"; exit 1; }
+          [[ "$TILES" =~ ^[0-9EWNS_\ ]*$ ]] || { echo "::error::bad tiles: $TILES"; exit 1; }
+          echo "pack=$PACK" >> "$GITHUB_OUTPUT"
+
+  leaftype:
+    needs: inputs
+    if: ${{ needs.inputs.outputs.pack == 'leaftype' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q "numpy==$NP" "pillow==$PL" "rasterio==$RIO"
+      - name: "ESA CCI Land Cover 2015 (CEDA, open), the pack, staged and checked"
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p src art
+          python tools/build_leaftype_pack.py fetch src/lc2015.tif
+          python tools/build_leaftype_pack.py build src/lc2015.tif build --version "$VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
+          mkdir art/leaftype
+          cp build/leaftype.png build/manifest.json art/leaftype/
+          cp winterpacks/leaftype-ATTRIBUTION.md art/leaftype/ATTRIBUTION.md
+          python3 -I tools/winterpack_ci.py check art leaftype | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: leaftype-build
+          path: art
+          retention-days: 30
+
+  watershare_plan:
+    needs: inputs
+    if: ${{ needs.inputs.outputs.pack == 'watershare' }}
+    runs-on: ubuntu-latest
+    outputs:
+      groups: ${{ steps.plan.outputs.groups }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - id: plan
+        name: "The provider's source tiles (504), in groups of about equal count"
+        env:
+          TILES: ${{ github.event.inputs.tiles }}
+        run: |
+          set -euo pipefail
+          if [ -n "$TILES" ]; then echo "$TILES" | tr ' ' '\n' | sed '/^$/d' > tiles.txt
+          else python3 -I tools/build_water_pack.py tiles > tiles.txt; fi
+          n=$(wc -l < tiles.txt)
+          [ "$n" -ge 1 ] && [ "$n" -le 600 ] || { echo "::error::$n tiles"; exit 1; }
+          python3 -I - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          t = open("tiles.txt").read().split()
+          k = 12
+          groups = [" ".join(t[i::k]) for i in range(k) if t[i::k]]
+          print("groups=" + json.dumps(groups))
+          PY
+          echo "$n source tiles" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: watershare-tiles
+          path: tiles.txt
+          retention-days: 30
+
+  watershare_build:
+    needs: watershare_plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: true
+      max-parallel: 12
+      matrix:
+        tiles: ${{ fromJson(needs.watershare_plan.outputs.groups) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q "numpy==$NP" "pillow==$PL" "rasterio==$RIO"
+      - name: "The group's source tiles: downloaded one at a time per job, reduced, deleted"
+        env:
+          TILES: ${{ matrix.tiles }}
+        run: |
+          set -euo pipefail
+          # (the names were checked by the inputs job; each is parsed again by the builder)
+          read -r -a T <<< "$TILES"
+          python tools/build_water_pack.py run part --tiles "${T[@]}" --jobs 3
+          echo "part=$(echo "${T[0]}" | tr -c '0-9A-Za-z_\n' _)" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: watershare-part-${{ env.part }}
+          path: part
+          retention-days: 7
+          include-hidden-files: false
+
+  watershare_gather:
+    needs: watershare_build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q "numpy==$NP" "pillow==$PL" "rasterio==$RIO"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          pattern: watershare-part-*
+          path: out
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: watershare-tiles
+          path: plan
+      - name: "Every source tile done, the manifest, staged and checked"
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+          TILES: ${{ github.event.inputs.tiles }}
+        run: |
+          set -euo pipefail
+          python tools/build_water_pack.py manifest out --version "$VERSION" --expect plan/tiles.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          mkdir art
+          python tools/build_water_pack.py stage out art/watershare --attribution winterpacks/watershare-ATTRIBUTION.md
+          if [ -n "$TILES" ]; then MIN=1; else MIN=3000; fi
+          python3 -I tools/winterpack_ci.py check art watershare --min "$MIN" | tee -a "$GITHUB_STEP_SUMMARY"
+          du -sh art/watershare | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: watershare-build
+          path: art
+          retention-days: 30
+
+  publish:
+    needs: [inputs, leaftype, watershare_gather]
+    if: >-
+      ${{ !cancelled() && github.event.inputs.dry_run != 'true' && github.ref == 'refs/heads/main'
+          && github.event.inputs.tiles == ''
+          && (needs.leaftype.result == 'success' || needs.watershare_gather.result == 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (R2 and aws-cli 2.23+'s default checksums: rail.yml)
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: ${{ needs.inputs.outputs.pack }}-build
+          path: art
+      - name: "Checked again, the version's keys listed, the files uploaded, the manifest last"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          PACK: ${{ needs.inputs.outputs.pack }}
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          chk() { python3 -I tools/winterpack_ci.py "$@"; }
+          chk check art "$PACK" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$(chk key art "$PACK")" = "$VERSION" ] || { echo "::error::the artifact is not version $VERSION"; exit 1; }
+          P="$PACK/$VERSION"
+          aws configure set default.s3.multipart_threshold 64MB
+          # (list-objects-v2 exits 0 on an empty prefix and non-zero on an auth / network error: no silent "not there")
+          aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$P/" --endpoint-url "$R2" --output json > before.json
+          chk todo art "$PACK" --version "$VERSION" --listing before.json > todo.txt
+          echo "$(wc -l < todo.txt) files to upload to $P" | tee -a "$GITHUB_STEP_SUMMARY"
+          while read -r f k; do
+            # (the names come from the checked manifest, never from a listing of the artifact)
+            [[ "$f" =~ ^art/$PACK/([0-9]{1,3}/[0-9]{1,2}\.png|leaftype\.png|ATTRIBUTION\.md)$ && "$k" == "$P/${f#art/$PACK/}" ]] \
+              || { echo "::error::bad upload line: $f $k"; exit 1; }
+            case "$f" in *.md) ct="text/markdown; charset=utf-8";; *) ct=image/png;; esac
+            for try in 1 2 3; do
+              aws s3 cp "$f" "s3://$BUCKET/$k" --endpoint-url "$R2" --only-show-errors \
+                --content-type "$ct" --cache-control "public, max-age=31536000, immutable" < /dev/null && break
+              test "$try" -lt 3; sleep $((try * 20))
+            done
+          done < todo.txt
+          aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$P/" --endpoint-url "$R2" --output json > after.json
+          STATE=$(chk todo art "$PACK" --version "$VERSION" --listing after.json --complete)
+          if [ "$STATE" = "published" ]; then
+            echo "$P: published before (manifest there with the same size): not written again" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            aws s3 cp "art/$PACK/manifest.json" "s3://$BUCKET/$P/manifest.json" --endpoint-url "$R2" --only-show-errors \
+              --content-type application/json --cache-control "public, max-age=86400" < /dev/null
+            echo "$P: every file uploaded, manifest.json last" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+  live:
+    needs: [inputs, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: ${{ needs.inputs.outputs.pack }}-build
+          path: art
+      - name: "Through the CDN: the manifest and a sample of the files, byte for byte"
+        env:
+          PACK: ${{ needs.inputs.outputs.pack }}
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          python3 -I tools/winterpack_ci.py live art "$PACK" --base "$CDN/$PACK/$VERSION" --sample 60 | tee -a "$GITHUB_STEP_SUMMARY"
+          {
+            echo ""
+            echo "Players read it once cdn.json names it (a commit to main, by hand, last):"
+            echo ""
+            echo "    python3 -I tools/winterpack_ci.py cdn-key cdn.json $PACK $VERSION && git commit -m \"cdn.json: $PACK $VERSION\" cdn.json"
+          } >> "$GITHUB_STEP_SUMMARY"

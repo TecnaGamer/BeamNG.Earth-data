@@ -136,6 +136,21 @@ part against its shard's record before upload, and an archive's index is written
 The server reads them when `BNGE_BNWT_URL` is `https://tiles.tgforever.net`. Data © OpenStreetMap contributors,
 Overture Maps Foundation.
 
+## leaftype/ and watershare/: the winter looks' raster packs (tile host only, workflow "winterpacks")
+
+Two static packs for BeamNG.Earth's white winter ground and bare trees (`README-winterpacks.md`), under
+`leaftype/<version>/` and `watershare/<version>/`, each with a `manifest.json` (every file's size and SHA-256)
+uploaded last; players read a pack once `cdn.json` has `{"<pack>": {"enabled": true, "version": "<version>"}}`.
+
+- **leaftype**: the evergreen share of the trees and the tree cover at 0.05 degrees (one 7200 x 3600 PNG), from the
+  ESA Land Cover CCI 2015 map (v2.0.7, 300 m) and its Product User Guide's plant functional types. ESA Land Cover CCI
+  project team; Defourny, P. (2019): ESA Land Cover Climate Change Initiative (Land_Cover_cci): Global Land Cover
+  Maps, Version 2.0.7. Centre for Environmental Data Analysis. Used under the Land Cover CCI terms (any use,
+  acknowledging the ESA Climate Change Initiative and the Land Cover CCI project).
+- **watershare**: the share of water at 0.004 degrees in 2-degree PNG shards, from the JRC Global Surface Water v1.5
+  occurrence (30 m, 1984-2024). Source: EC JRC/Google; Pekel et al. (2016), Nature 540, 418-422. Produced under the
+  Copernicus Programme, provided free of charge without restriction of use.
+
 ## cdn.json "overture": the Overture release players read (daily, workflow "overture")
 
 BeamNG.Earth reads the map data from one Overture release. A build ships its own (`server/overturepick.py`
