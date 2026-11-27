@@ -30,7 +30,13 @@ else (and git / gh). BeamNG.Earth's own code runs only in the jobs without write
         Prints ready, pending, stuck (a candidate older than --stuck-days).
     overture_ci.py flip-cdn FILE --release R
         cdn.json's "overture" key set to {"release": R} by a minimal text edit (every other key byte-identical),
-        checked by parsing both; never to a release older than the one it names.
+        checked by parsing both; never to a release older than the one it names. With --bnwt-format/--bnwt-names/
+        --cip-format, the "bnwt" and "cip" keys follow in the same edit (see sync-cdn).
+    overture_ci.py sync-cdn FILE --bnwt-format F --bnwt-names J --cip-format F [--release R]
+        cdn.json's "bnwt" and "cip" keys moved to R (default: cdn.json's overture release) by the same minimal edit, each
+        only when it exists with enabled true, its release is older, and that release's build is on the tile host
+        (bnwt: every archive's bnwt<F>/R/<name>.index.json answers; cip: cip<F>/R/latest.json names a build whose
+        cells.index.json answers). Otherwise the key stays (inert, safe) and the summary says so.
 """
 import argparse
 import datetime
@@ -64,6 +70,8 @@ UA = "BeamNG.Earth-data overture workflow"
 MAX_DROP_PCT = 3.0
 MAX_GROW_PCT = 10.0
 SLACK = 25
+SYNC_KEYS = ("bnwt", "cip")          # (cdn.json's keys the app reads only when their release is its Overture release)
+BUILD_RE = re.compile(r"[0-9a-f]{16}")
 BNWT_ARCHIVES = {"base", "transportation", "buildings", "places"}    # (BeamNG.Earth bnwt.ARCHIVES: all of them)
 
 
@@ -678,7 +686,152 @@ def flip_text(text, release):
     return new
 
 
+# --- bnwt / cip keys follow the overture key -------------------------------------------------------------------------
+def _check_names(bnwt_names):
+    try:
+        names = json.loads(bnwt_names)
+    except (TypeError, ValueError):
+        raise SystemExit(f"bnwt names {bnwt_names!r}")
+    if not (isinstance(names, dict) and set(names) == BNWT_ARCHIVES and all(
+            isinstance(v, str) and re.fullmatch(r"[a-z]+\.c\d+", v) and v.startswith(k + ".c")
+            for k, v in names.items())):
+        raise SystemExit(f"bnwt names {bnwt_names!r} are not one name for each of {sorted(BNWT_ARCHIVES)}")
+    return names
+
+
+def probe_bnwt(release, bnwt_format, bnwt_names, cdn=CDN, fetch=get):
+    """(published, why): every BNWT archive's index of release answers on the tile host."""
+    if not (valid(release) and re.fullmatch(r"\d{1,3}", bnwt_format or "")):
+        raise SystemExit("probe_bnwt: a bad release or format")
+    for arch, name in sorted(_check_names(bnwt_names).items()):
+        st, _ = fetch(f"{cdn}/bnwt{bnwt_format}/{release}/{name}.index.json", 1 << 20)
+        if st != 200:
+            return False, f"{name}.index.json of {release}: HTTP {st}"
+    return True, f"every archive index of {release} answers"
+
+
+def probe_cip(release, cip_format, cdn=CDN, fetch=get):
+    """(published, why): latest.json of release names a build (16 hex) whose cells.index.json answers and is that build's."""
+    if not (valid(release) and re.fullmatch(r"\d{1,3}", cip_format or "")):
+        raise SystemExit("probe_cip: a bad release or format")
+    base = f"{cdn}/cip{cip_format}/{release}"
+    st, body = fetch(f"{base}/latest.json", 4096)
+    if st != 200:
+        return False, f"latest.json of {release}: HTTP {st}"
+    try:
+        doc = json.loads(body)
+    except (TypeError, ValueError):
+        return False, "latest.json: not JSON"
+    build = doc.get("build") if isinstance(doc, dict) else None
+    if not (isinstance(build, str) and BUILD_RE.fullmatch(build)):
+        return False, "latest.json: no build id"
+    st, body = fetch(f"{base}/{build}/cells.index.json", 256 << 20)
+    if st != 200:
+        return False, f"{build}/cells.index.json: HTTP {st}"
+    try:
+        idx = json.loads(body)
+    except (TypeError, ValueError):
+        return False, f"{build}/cells.index.json: not JSON"
+    if not (isinstance(idx, dict) and idx.get("release") == release and idx.get("build") == build):
+        return False, f"{build}/cells.index.json: another build"
+    return True, f"build {build} of {release} has its index"
+
+
+def lagging(text, release):
+    """The SYNC_KEYS whose value exists, is enabled and names a release older than release (the ones to move)."""
+    if not valid(release):
+        raise SystemExit(f"not a release id: {release!r}")
+    doc = json.loads(text)
+    out = []
+    for k in SYNC_KEYS:
+        v = doc.get(k) if isinstance(doc, dict) else None
+        if isinstance(v, dict) and v.get("enabled") is True and valid(v.get("release")) \
+                and order(v["release"]) < order(release):
+            out.append(k)
+    return out
+
+
+def sync_text(text, release, published):
+    """(new text, [report lines]): each SYNC_KEYS key that lags and is in published (a set of keys whose build of
+    release is on the tile host) set to release by a minimal edit; other keys byte-identical. A key that is absent or
+    not enabled is never touched; one whose build is not out stays (inert, safe)."""
+    if not valid(release):
+        raise SystemExit(f"not a release id: {release!r}")
+    before = json.loads(text)
+    if not isinstance(before, dict):
+        raise SystemExit("cdn.json: not an object")
+    spans, _ = _top_spans(text)
+    todo, report = [], []
+    for k in SYNC_KEYS:
+        v = before.get(k)
+        if v is None:
+            report.append(f"- {k}: no such key in cdn.json: left alone")
+        elif not (isinstance(v, dict) and v.get("enabled") is True):
+            report.append(f"- {k}: not enabled: left alone")
+        elif not valid(v.get("release")):
+            report.append(f"- {k}: no release id: left alone")
+        elif v["release"] == release:
+            report.append(f"- {k}: names {release} already")
+        elif order(v["release"]) > order(release):
+            report.append(f"- {k}: names {v['release']}, newer than {release}: left alone")
+        elif k in published:
+            todo.append(k)
+            report.append(f"- {k}: {v['release']} -> {release}")
+        else:
+            report.append(f"- WAITING: {k}: the build of {release} is not published on the tile host; "
+                          f"stays at {v['release']} (inert until then)")
+    if not todo:
+        return text, report
+    new, want = text, dict(before)
+    for k in sorted(todo, key=lambda x: -spans[x][0]):          # (last first: earlier offsets stay valid)
+        s, e = spans[k]
+        value = dict(before[k], release=release)
+        new = new[:s] + json.dumps(value, separators=(", ", ": ")) + new[e:]
+        want[k] = value
+    if json.loads(new) != want:
+        raise SystemExit("cdn.json: the edit changed more than the bnwt/cip keys")
+    ns, _ = _top_spans(new)
+    for k, (s, e) in spans.items():
+        if k not in todo and text[s:e] != new[ns[k][0]:ns[k][1]]:
+            raise SystemExit(f"cdn.json: key {k!r} not byte-identical after the edit")
+    if len(new.encode("utf-8")) > SWITCH_MAX:
+        raise SystemExit(f"cdn.json: more than {SWITCH_MAX} bytes")
+    return new, report
+
+
+def sync_keys(text, release, bnwt_format, bnwt_names, cip_format, cdn=CDN, fetch=get):
+    """sync_text with the tile host asked (only for the keys that lag)."""
+    lag = lagging(text, release)
+    got, why = set(), {}
+    if "bnwt" in lag:
+        ok, why["bnwt"] = probe_bnwt(release, bnwt_format, bnwt_names, cdn, fetch)
+        if ok:
+            got.add("bnwt")
+    if "cip" in lag:
+        ok, why["cip"] = probe_cip(release, cip_format, cdn, fetch)
+        if ok:
+            got.add("cip")
+    new, report = sync_text(text, release, got)
+    report += [f"  - {k}: {w}" for k, w in sorted(why.items()) if k not in got]
+    return new, report
+
+
+def _write(path, new):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        f.write(new)
+    os.replace(tmp, path)
+
+
+def _sync_args(a):
+    have = [bool(a.bnwt_format), bool(a.bnwt_names), bool(a.cip_format)]
+    if any(have) and not all(have):
+        raise SystemExit("--bnwt-format, --bnwt-names and --cip-format go together")
+    return all(have)
+
+
 def cmd_flip_cdn(a):
+    sync = _sync_args(a)
     with open(a.file, encoding="utf-8") as f:
         text = f.read(SWITCH_MAX + 1)
     if a.expect_served:         # (cdn.json changed since the gate was checked against the served release: not flipped)
@@ -689,12 +842,32 @@ def cmd_flip_cdn(a):
     new = flip_text(text, a.release)
     if new == text:
         print(f"{a.file}: names {a.release} already")
-        return 0
-    tmp = a.file + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="") as f:
-        f.write(new)
-    os.replace(tmp, a.file)
-    print(f"{a.file}: overture release {a.release}")
+    else:
+        print(f"{a.file}: overture release {a.release}")
+    if sync:
+        new, report = sync_keys(new, a.release, a.bnwt_format, a.bnwt_names, a.cip_format)
+        print(f"bnwt / cip keys for {a.release}:\n" + "\n".join(report))
+    if new != text:
+        _write(a.file, new)
+    return 0
+
+
+def cmd_sync_cdn(a):
+    if not _sync_args(a):
+        raise SystemExit("sync-cdn: --bnwt-format, --bnwt-names and --cip-format are required")
+    with open(a.file, encoding="utf-8") as f:
+        text = f.read(SWITCH_MAX + 1)
+    rel = a.release
+    if not rel:
+        on = json.loads(text).get("overture")
+        rel = on.get("release") if isinstance(on, dict) else None
+        if not valid(rel):
+            print(f"{a.file}: no overture release: nothing to follow")
+            return 0
+    new, report = sync_keys(text, rel, a.bnwt_format, a.bnwt_names, a.cip_format)
+    print(f"bnwt / cip keys for {rel}:\n" + "\n".join(report))
+    if new != text:
+        _write(a.file, new)
     return 0
 
 
@@ -750,10 +923,17 @@ def main():
     p.add_argument("file")
     p.add_argument("--release", required=True)
     p.add_argument("--expect-served", default="", help="refuse when cdn.json names another release than this")
+    p = sub.add_parser("sync-cdn")
+    p.add_argument("file")
+    p.add_argument("--release", default="", help="default: cdn.json's overture release")
+    for pp in (p, sub.choices["flip-cdn"]):
+        pp.add_argument("--bnwt-format", default="")
+        pp.add_argument("--bnwt-names", default="")
+        pp.add_argument("--cip-format", default="")
     a = ap.parse_args()
     return {"detect": cmd_detect, "corpus": cmd_corpus, "check-stac": cmd_check_stac, "check-places": cmd_check_places,
             "stage-stac": cmd_stage_stac, "candidate": cmd_candidate, "gate": cmd_gate,
-            "flip-cdn": cmd_flip_cdn}[a.cmd](a)
+            "flip-cdn": cmd_flip_cdn, "sync-cdn": cmd_sync_cdn}[a.cmd](a)
 
 
 if __name__ == "__main__":

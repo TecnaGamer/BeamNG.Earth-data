@@ -16,7 +16,9 @@ this repo run tools/overture_ci.py (standard library only) instead.
         again), vkey (decisions.vkey of the map data's versions in a decision builder's environment with
         BNGE_OVERTURE_RELEASE=R: tools/build_decisions.py's player_env, the switch's DEM release, a block worker set up
         as its _worker sets one up), dec_format (decisions.FORMAT), bnwt_format and bnwt_names (bnwt.FORMAT, the
-        archives' index names, as bnwt.yml computes them).
+        archives' index names, as bnwt.yml computes them), cip_format (server/cip.py's FORMAT, read as text).
+    overture_appcode.py tile-info --tree CODE
+        bnwt_format, bnwt_names and cip_format only (the daily bnwt / cip key check needs no release).
 """
 import argparse
 import json
@@ -151,6 +153,26 @@ def vkey_info(release, cache):
     return vv[0], decisions.FORMAT, v
 
 
+def cip_format(tree):
+    """cip.FORMAT of the tree, read as text (the module needs the native build)."""
+    with open(os.path.join(tree, "server", "cip.py"), encoding="utf-8") as f:
+        m = re.search(r"^FORMAT = (\d{1,3})\b", f.read(1 << 20), re.M)
+    if not m:
+        raise SystemExit("server/cip.py: no FORMAT = <n> line")
+    return m[1]
+
+
+def cmd_tile_info(a):
+    tree = _tree(a.tree)
+    import bnwt
+    names = {k: f"{k}.c{bnwt.CONTENT[k]}" for k in bnwt.ARCHIVES}
+    out = {"bnwt_format": str(int(bnwt.FORMAT)), "bnwt_names": json.dumps(names, separators=(",", ":"), sort_keys=True),
+           "cip_format": cip_format(tree)}
+    for k, v in out.items():
+        print(f"{k}={v}")
+    return 0
+
+
 def cmd_gate_info(a):
     _tree(a.tree)
     rel = _release(a.release)
@@ -161,7 +183,8 @@ def cmd_gate_info(a):
     import bnwt
     names = {k: f"{k}.c{bnwt.CONTENT[k]}" for k in bnwt.ARCHIVES}
     out = {"schema_ok": "true" if ok else "false", "vkey": vk, "dec_format": str(int(fmt)),
-           "bnwt_format": str(int(bnwt.FORMAT)), "bnwt_names": json.dumps(names, separators=(",", ":"), sort_keys=True)}
+           "bnwt_format": str(int(bnwt.FORMAT)), "bnwt_names": json.dumps(names, separators=(",", ":"), sort_keys=True),
+           "cip_format": cip_format(os.path.abspath(a.tree))}
     for k, v in out.items():
         print(f"{k}={v}")
     return 0
@@ -182,8 +205,10 @@ def main():
     p.add_argument("--tree", required=True)
     p.add_argument("--release", required=True)
     p.add_argument("--cache", required=True)
+    p = sub.add_parser("tile-info")
+    p.add_argument("--tree", required=True)
     a = ap.parse_args()
-    return {"schema": cmd_schema, "counts": cmd_counts, "gate-info": cmd_gate_info}[a.cmd](a)
+    return {"tile-info": cmd_tile_info, "schema": cmd_schema, "counts": cmd_counts, "gate-info": cmd_gate_info}[a.cmd](a)
 
 
 if __name__ == "__main__":

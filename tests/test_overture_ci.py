@@ -253,3 +253,166 @@ class NewLayerTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SyncKeysTest(unittest.TestCase):
+    """cdn.json's bnwt / cip keys follow the overture key once the build of the new release is on the tile host."""
+    NAMES = json.dumps({a: f'{a}.c1' for a in sorted(ci.BNWT_ARCHIVES)}, separators=(',', ':'))
+    OLD, NEW = '2026-11-18.0', '2026-12-16.0'
+    BUILD = '0123456789abcdef'
+    CDN = ('{"imagery": {"bngs2": {"enabled": true, "max_zoom": 13}},\n "overture": {"release": "2026-11-18.0"},\n'
+           ' "bnwt": {"enabled": true, "release": "2026-11-18.0"}, "cip": {"enabled": true, "release": "2026-11-18.0"},\n'
+           ' "decisions": {"enabled": true, "request": false}}\n')
+
+    def fetcher(self, bnwt=True, cip=True, latest=None, index=None, missing=()):
+        base = ci.CDN
+        files = {}
+        if bnwt:
+            for n in json.loads(self.NAMES).values():
+                files[f'{base}/bnwt2/{self.NEW}/{n}.index.json'] = b'{}'
+        if cip:
+            files[f'{base}/cip1/{self.NEW}/latest.json'] = latest if latest is not None else \
+                json.dumps({'build': self.BUILD}).encode()
+            files[f'{base}/cip1/{self.NEW}/{self.BUILD}/cells.index.json'] = index if index is not None else \
+                json.dumps({'release': self.NEW, 'build': self.BUILD, 'format': 'cip'}).encode()
+        for m in missing:
+            files.pop(m, None)
+        calls = []
+
+        def fetch(url, max_bytes, tries=3):
+            calls.append(url)
+            return (200, files[url]) if url in files else (404, b'')
+        fetch.calls = calls
+        return fetch
+
+    def sync(self, text, fetch):
+        return ci.sync_keys(text, self.NEW, '2', self.NAMES, '1', fetch=fetch)
+
+    def test_both_published(self):
+        new, rep = self.sync(self.CDN, self.fetcher())
+        self.assertEqual(new, self.CDN.replace(self.OLD, self.NEW).replace(
+            '"overture": {"release": "2026-12-16.0"}', '"overture": {"release": "2026-11-18.0"}'))
+        d = json.loads(new)
+        self.assertEqual((d['bnwt']['release'], d['cip']['release'], d['overture']['release']),
+                         (self.NEW, self.NEW, self.OLD))
+        self.assertTrue(d['bnwt']['enabled'] and d['cip']['enabled'])
+
+    def test_one_published_one_missing(self):
+        new, rep = self.sync(self.CDN, self.fetcher(cip=False))
+        d = json.loads(new)
+        self.assertEqual((d['bnwt']['release'], d['cip']['release']), (self.NEW, self.OLD))
+        self.assertTrue(any('WAITING: cip' in r for r in rep))
+        new, rep = self.sync(self.CDN, self.fetcher(bnwt=False))
+        d = json.loads(new)
+        self.assertEqual((d['bnwt']['release'], d['cip']['release']), (self.OLD, self.NEW))
+        self.assertTrue(any('WAITING: bnwt' in r for r in rep))
+
+    def test_one_bnwt_archive_missing_is_not_published(self):
+        gone = f'{ci.CDN}/bnwt2/{self.NEW}/places.c1.index.json'
+        new, rep = self.sync(self.CDN, self.fetcher(missing=(gone,)))
+        self.assertEqual(json.loads(new)['bnwt']['release'], self.OLD)
+
+    def test_cip_without_its_cells_index_is_not_published(self):
+        gone = f'{ci.CDN}/cip1/{self.NEW}/{self.BUILD}/cells.index.json'
+        new, rep = self.sync(self.CDN, self.fetcher(missing=(gone,)))
+        self.assertEqual(json.loads(new)['cip']['release'], self.OLD)
+
+    def test_neither_published_leaves_the_text_identical(self):
+        new, rep = self.sync(self.CDN, self.fetcher(bnwt=False, cip=False))
+        self.assertEqual(new, self.CDN)
+
+    def test_absent_or_disabled_keys_are_never_enabled_or_added(self):
+        text = '{"overture": {"release": "2026-11-18.0"}, "bnwt": {"enabled": false, "release": "2026-11-18.0"}}'
+        f = self.fetcher()
+        new, rep = self.sync(text, f)
+        self.assertEqual(new, text)
+        self.assertEqual(f.calls, [])           # (nothing to move: the host is not even asked)
+        self.assertTrue(any('not enabled' in r for r in rep) and any('no such key' in r for r in rep))
+        text = '{"bnwt": {"release": "2026-11-18.0"}, "cip": {"enabled": "yes", "release": "2026-11-18.0"}}'
+        self.assertEqual(self.sync(text, self.fetcher())[0], text)
+
+    def test_never_backwards_and_same_release_left(self):
+        text = '{"bnwt": {"enabled": true, "release": "2027-01-20.0"}, "cip": {"enabled": true, "release": "2026-12-16.0"}}'
+        self.assertEqual(self.sync(text, self.fetcher())[0], text)
+
+    def test_malformed_responses_count_as_not_published(self):
+        for latest, index in ((b'not json', None), (b'[]', None), (b'{"build": "../../x"}', None),
+                              (b'{"build": 5}', None), (None, b'not json'), (None, b'[]'),
+                              (None, json.dumps({'release': self.OLD, 'build': self.BUILD}).encode()),
+                              (None, json.dumps({'release': self.NEW, 'build': 'f' * 16}).encode())):
+            new, rep = self.sync(self.CDN, self.fetcher(bnwt=False, latest=latest, index=index))
+            self.assertEqual(new, self.CDN, (latest, index))
+
+    def test_no_answer_is_not_published(self):
+        def dead(url, max_bytes, tries=3):
+            return 0, 'timed out'
+        self.assertEqual(self.sync(self.CDN, dead)[0], self.CDN)
+
+    def test_bad_inputs_stop(self):
+        for args in (('2026-12-16.0; x', '2', self.NAMES, '1'), (self.NEW, '2/../x', self.NAMES, '1'),
+                     (self.NEW, '2', self.NAMES, '1/x'), (self.NEW, '2', '{"base":"base.c1"}', '1'),
+                     (self.NEW, '2', '{"base":"../x","transportation":"transportation.c1","buildings":"buildings.c1",'
+                      '"places":"places.c1"}', '1')):
+            with self.assertRaises(SystemExit):
+                ci.sync_keys(self.CDN, *args, fetch=self.fetcher())
+
+    def test_other_keys_byte_identical_odd_spacing(self):
+        text = ('{ "a":[1,  2],\n"bnwt" :{"enabled":true,"release":"2026-11-18.0","x":1} ,"z":  {"q" :  null}  ,'
+                '"cip":{"enabled":true,"release":"2026-11-18.0"}\n}\n')
+        new, _ = self.sync(text, self.fetcher())
+        self.assertIn('{ "a":[1,  2],\n"bnwt" :', new)
+        self.assertIn(',"z":  {"q" :  null}  ,', new)
+        self.assertTrue(new.endswith('\n}\n'))
+        d = json.loads(new)
+        self.assertEqual(d['bnwt'], {'enabled': True, 'release': self.NEW, 'x': 1})
+        self.assertEqual(d['cip'], {'enabled': True, 'release': self.NEW})
+
+    def test_flip_command_moves_all_in_one_edit(self):
+        import argparse
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / 'cdn.json'
+            p.write_text(self.CDN)
+            real = ci.get
+            f = self.fetcher()
+            ci.get = f
+            try:
+                # (sync_keys' default fetch was bound at definition: call it through the command with the host faked)
+                orig = ci.sync_keys
+                ci.sync_keys = lambda *a, **k: orig(*a, fetch=f, **k)
+                a = argparse.Namespace(file=str(p), release=self.NEW, expect_served=self.OLD, bnwt_format='2',
+                                       bnwt_names=self.NAMES, cip_format='1')
+                self.assertEqual(ci.cmd_flip_cdn(a), 0)
+            finally:
+                ci.get = real
+                ci.sync_keys = orig
+            d = json.loads(p.read_text())
+            self.assertEqual((d['overture']['release'], d['bnwt']['release'], d['cip']['release']), (self.NEW,) * 3)
+            self.assertEqual(d['imagery'], {'bngs2': {'enabled': True, 'max_zoom': 13}})
+            # (a second run changes nothing)
+            before = p.read_text()
+            ci.sync_keys = lambda *a, **k: orig(*a, fetch=f, **k)
+            try:
+                self.assertEqual(ci.cmd_flip_cdn(a), 0)
+            finally:
+                ci.sync_keys = orig
+            self.assertEqual(p.read_text(), before)
+
+    def test_sync_command_follows_the_served_release(self):
+        import argparse
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / 'cdn.json'
+            p.write_text(self.CDN.replace('"overture": {"release": "2026-11-18.0"}', '"overture": {"release": "2026-12-16.0"}'))
+            f = self.fetcher()
+            orig = ci.sync_keys
+            ci.sync_keys = lambda *a, **k: orig(*a, fetch=f, **k)
+            try:
+                a = argparse.Namespace(file=str(p), release='', bnwt_format='2', bnwt_names=self.NAMES, cip_format='1')
+                self.assertEqual(ci.cmd_sync_cdn(a), 0)
+            finally:
+                ci.sync_keys = orig
+            d = json.loads(p.read_text())
+            self.assertEqual((d['bnwt']['release'], d['cip']['release']), (self.NEW, self.NEW))
+            # no overture key: nothing to follow
+            p.write_text('{"bnwt": {"enabled": true, "release": "2026-11-18.0"}}')
+            self.assertEqual(ci.cmd_sync_cdn(a), 0)
+            self.assertEqual(p.read_text(), '{"bnwt": {"enabled": true, "release": "2026-11-18.0"}}')
