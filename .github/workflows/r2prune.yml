@@ -55,10 +55,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # (tiles / tiles-s2c / aerial write s2wc/, s2c/ and aerial/, which r2prune only reports, never deletes: the planet
+          # imagery driver queues them almost all the time, and waiting on them the weekly run would never run)
           BUSY=""
           for st in in_progress queued waiting; do
             BUSY="$BUSY$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?status=$st&per_page=100" \
-              --jq ".workflow_runs[] | select(.id != $GITHUB_RUN_ID and .name != \"r2prune\") | \"\(.name) #\(.id) (\(.status))\"")"$'\n'
+              --jq ".workflow_runs[] | select(.id != $GITHUB_RUN_ID and (.name | IN(\"r2prune\", \"tiles\", \"tiles-s2c\", \"tiles-s2c-shards\", \"aerial\", \"aerial-chunk\") | not)) | \"\(.name) #\(.id) (\(.status))\"")"$'\n'
           done
           BUSY=$(printf '%s' "$BUSY" | sed '/^$/d')
           if [ -n "$BUSY" ]; then
