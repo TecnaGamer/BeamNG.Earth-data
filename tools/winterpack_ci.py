@@ -14,6 +14,9 @@ decodes an image beyond its PNG chunk structure.
   nbiskew/<version>/nbiskew.npz         the US National Bridge Inventory's skews (items 16, 17, 34, 49), one npz
   nbiskew/<version>/ATTRIBUTION.md      (tools/build_nbiskew.py: lat, lon float32, skew uint8, length uint16)
   nbiskew/<version>/manifest.json       uploaded LAST
+  powerplants/<version>/power_plants.npz  BeamNG.Earth's thermal power plants with their mapped cooling towers and
+  powerplants/<version>/ATTRIBUTION.md    chimneys (BeamNG.Earth tools/build_powerplants.py, a pinned copy here; the
+  powerplants/<version>/manifest.json     weekly powerplants workflow), uploaded LAST
 
 Players' servers read a pack only once cdn.json has {"<pack>": {"enabled": true, "version": "<version>"}} (a hand
 commit after the live check, last). A published version is never overwritten: a version whose manifest.json is in the
@@ -34,6 +37,7 @@ bucket is only compared (state=published); a change needs a new version. Nothing
   live ART PACK --base URL [--sample N]
                           manifest.json and the files (watershare: N of them, spread evenly, and the largest) fetched
                           through the CDN and compared byte for byte with the artifact
+  next-version FILE PACK  the version after the one cdn.json's PACK key names (v1 when it names none)
   cdn-key FILE PACK VERSION
                           cdn.json's PACK key set to {"enabled": true, "version": VERSION} by a minimal text edit (every
                           other key byte-identical), checked by parsing both
@@ -57,11 +61,22 @@ PACKS = {
     "leaftype": {"width": 7200, "height": 3600, "colour": 4, "single": "leaftype.png", "min": 1},
     "watershare": {"width": 500, "height": 500, "colour": 0, "single": None, "min": 3000},
     "nbiskew": {"single": "nbiskew.npz", "min": 1},
+    "powerplants": {"single": "power_plants.npz", "min": 1},
 }
+# the power plants' index (BeamNG.Earth server/powerplants.py validate): each column's dtype and which count its
+# length is (p: plants, s: structures, p1: plants + 1, any: the names' bytes, one: 1)
+PP_COLUMNS = {"schema": ("<i4", "one"), "p_lat": ("<i4", "p"), "p_lon": ("<i4", "p"), "p_fuel": ("|u1", "p"),
+              "p_state": ("|u1", "p"), "p_flags": ("|u1", "p"), "p_mw": ("<f4", "p"), "p_closed": ("<i2", "p"),
+              "p_radius": ("<f4", "p"), "p_osm": ("<i8", "p"), "p_osm_type": ("|u1", "p"), "p_name_off": ("<i4", "p1"),
+              "names": ("|u1", "any"), "s_lat": ("<i4", "s"), "s_lon": ("<i4", "s"), "s_kind": ("|u1", "s"),
+              "s_height": ("<f4", "s"), "s_diam": ("<f4", "s"), "s_osm": ("<i8", "s"), "s_osm_type": ("|u1", "s"),
+              "s_building": ("|u1", "s"), "s_plant": ("<i4", "s")}
+PP_PLANTS = (5000, 200_000)         # a build's plant count (fewer: a cut-off build)
+PP_STRUCTS = (10_000, 2_000_000)
 NBI_COLUMNS = {"lat": "<f4", "lon": "<f4", "skew": "|u1", "length": "<u2"}
 NBI_MIN_RECORDS = 100000
 CREDIT = {"leaftype": ("Copernicus", "Land Cover CCI"), "watershare": ("Copernicus", "Land Cover CCI"),
-          "nbiskew": ("National Bridge Inventory",)}
+          "nbiskew": ("National Bridge Inventory",), "powerplants": ("OpenStreetMap contributors",)}
 VERSION_RE = re.compile(r"v[1-9][0-9]{0,3}")
 SHARD_RE = re.compile(r"(\d{1,3})/(\d{1,2})\.png")
 HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -161,6 +176,37 @@ def npz_check(path, records):
                 refuse(f"{i.filename}: {i.file_size} bytes uncompressed")
 
 
+def pp_npz_check(path, plants, structures):
+    """The power plants' npz: a plain zip of exactly PP_COLUMNS' .npy members (stored or deflated, no pickles), each
+    header its column's dtype, C order, one dimension of its count's length, the uncompressed size adding up."""
+    import ast
+    import zipfile
+    with zipfile.ZipFile(path) as z:
+        infos = z.infolist()
+        if sorted(i.filename for i in infos) != sorted(k + ".npy" for k in PP_COLUMNS):
+            refuse(f"{path}: members {sorted(i.filename for i in infos)[:30]}")
+        for i in infos:
+            if i.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED) or i.flag_bits & 0x1:
+                refuse(f"{i.filename}: compression / encryption")
+            descr, n_of = PP_COLUMNS[i.filename[:-4]]
+            with z.open(i) as f:
+                head = f.read(10)
+                if head[:8] != b"\x93NUMPY\x01\x00":
+                    refuse(f"{i.filename}: not a .npy 1.0")
+                hl = struct.unpack("<H", head[8:10])[0]
+                if hl > 4096:
+                    refuse(f"{i.filename}: header too long")
+                d = ast.literal_eval(f.read(hl).decode("latin-1"))
+            want = {"p": plants, "s": structures, "p1": plants + 1, "one": 1}.get(n_of)
+            shape = d.get("shape") if isinstance(d, dict) else None
+            if not isinstance(d, dict) or d.get("descr") != descr or d.get("fortran_order") is not False \
+                    or not isinstance(shape, tuple) or len(shape) != 1 or not isinstance(shape[0], int) \
+                    or shape[0] < 0 or (want is not None and shape[0] != want):
+                refuse(f"{i.filename}: header {d!r}, not {descr} of {n_of}")
+            if i.file_size != 10 + hl + shape[0] * int(descr[2:]):
+                refuse(f"{i.filename}: {i.file_size} bytes uncompressed")
+
+
 def walk(root):
     """{relative path: size} of every regular file under root; refuses links and special files."""
     out = {}
@@ -203,7 +249,17 @@ def load_manifest(root, pack):
 def files_of(m, pack):
     """{relative path: (size, sha256)} the manifest names."""
     out = {}
-    if pack == "nbiskew":
+    if pack == "powerplants":
+        fl = m.get("files")
+        if not isinstance(fl, list) or len(fl) != 1 or not isinstance(fl[0], dict) or \
+                fl[0].get("path") != PACKS[pack]["single"]:
+            refuse("manifest: files")
+        out[fl[0]["path"]] = (fl[0].get("size"), fl[0].get("sha256"))
+        n, k = m.get("plants"), m.get("structures")
+        for v, (lo, hi) in ((n, PP_PLANTS), (k, PP_STRUCTS)):
+            if not isinstance(v, int) or isinstance(v, bool) or not lo <= v <= hi:
+                refuse(f"manifest: plants / structures {n!r} {k!r}")
+    elif pack == "nbiskew":
         fl = m.get("files")
         if not isinstance(fl, list) or len(fl) != 1 or not isinstance(fl[0], dict) or \
                 fl[0].get("path") != PACKS[pack]["single"]:
@@ -272,6 +328,8 @@ def cmd_check(a):
             refuse(f"{p}: {have[p]} bytes, the manifest says {size}")
         if pack == "nbiskew":
             npz_check(os.path.join(root, p), m["records"])
+        elif pack == "powerplants":
+            pp_npz_check(os.path.join(root, p), m["plants"], m["structures"])
         else:
             png_check(os.path.join(root, p), prof)
         if sha256_file(os.path.join(root, p)) != sha:
@@ -443,6 +501,23 @@ def cmd_cdn_key(a):
     print(f"{a.file}: {a.pack} {a.version}")
 
 
+def cmd_next_version(a):
+    """The version after the one cdn.json's PACK key names (v1 when none)."""
+    with open(a.file, encoding="utf-8") as f:
+        d = json.loads(f.read(256 * 1024 + 1))
+    on = d.get(a.pack) if isinstance(d, dict) else None
+    v = str(on.get("version") or "") if isinstance(on, dict) else ""
+    if not v:
+        print("v1")
+        return
+    if not VERSION_RE.fullmatch(v):
+        refuse(f"cdn.json: {a.pack} names {v!r}")
+    n = int(v[1:]) + 1
+    if n > 9999:
+        refuse("no version left")
+    print(f"v{n}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -464,6 +539,9 @@ def main(argv=None):
     p.add_argument("pack", choices=sorted(PACKS))
     p.add_argument("--base", required=True)
     p.add_argument("--sample", type=int, default=40)
+    p = sub.add_parser("next-version")
+    p.add_argument("file")
+    p.add_argument("pack", choices=sorted(PACKS))
     p = sub.add_parser("cdn-key")
     p.add_argument("file")
     p.add_argument("pack", choices=sorted(PACKS))
@@ -480,6 +558,8 @@ def main(argv=None):
             cmd_todo(a)
         elif a.cmd == "live":
             cmd_live(a)
+        elif a.cmd == "next-version":
+            cmd_next_version(a)
         else:
             cmd_cdn_key(a)
     except (Refused, OSError, ValueError, KeyError, TypeError) as e:

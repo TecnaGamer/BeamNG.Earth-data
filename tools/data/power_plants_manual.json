@@ -1,0 +1,159 @@
+{
+ "_readme": "Sites whose state the data sources miss. state: demolished (left out) | towers_gone (closed, its cooling towers demolished, other buildings standing) | standing (closed, still standing: added if no source has it) | closed (closed in a given year) | running. Matched to plants within radius_m (default 4 km).",
+ "entries": [
+  {
+   "name": "Brayton Point",
+   "cc": "USA",
+   "lat": 41.711,
+   "lon": -71.192,
+   "fuel": "C",
+   "state": "demolished",
+   "note": "closed 2017; cooling towers and stacks demolished 2019"
+  },
+  {
+   "name": "Homer City",
+   "cc": "USA",
+   "lat": 40.511,
+   "lon": -79.196,
+   "fuel": "C",
+   "state": "demolished",
+   "note": "closed 2023; towers and stacks demolished 2025"
+  },
+  {
+   "name": "Ferrybridge C",
+   "cc": "GBR",
+   "lat": 53.715,
+   "lon": -1.282,
+   "fuel": "C",
+   "state": "demolished",
+   "note": "closed 2016; cooling towers demolished 2019-2022"
+  },
+  {
+   "name": "Eggborough",
+   "cc": "GBR",
+   "lat": 53.712,
+   "lon": -1.128,
+   "fuel": "C",
+   "state": "demolished",
+   "note": "closed 2018; demolished 2021-2022"
+  },
+  {
+   "name": "Rugeley B",
+   "cc": "GBR",
+   "lat": 52.756,
+   "lon": -1.915,
+   "fuel": "C",
+   "state": "demolished",
+   "note": "closed 2016; demolished 2019-2021"
+  },
+  {
+   "name": "Zion",
+   "cc": "USA",
+   "lat": 42.446,
+   "lon": -87.801,
+   "fuel": "N",
+   "state": "demolished",
+   "note": "closed 1998; dismantled"
+  },
+  {
+   "name": "Trojan",
+   "cc": "USA",
+   "lat": 46.04,
+   "lon": -122.887,
+   "fuel": "N",
+   "state": "demolished",
+   "note": "closed 1992; cooling tower demolished 2006"
+  },
+  {
+   "name": "Philippsburg",
+   "cc": "DEU",
+   "lat": 49.253,
+   "lon": 8.437,
+   "fuel": "N",
+   "state": "towers_gone",
+   "closed": 2019,
+   "note": "cooling towers demolished 2020; reactor buildings still standing"
+  },
+  {
+   "name": "Grafenrheinfeld",
+   "cc": "DEU",
+   "lat": 49.984,
+   "lon": 10.186,
+   "fuel": "N",
+   "state": "towers_gone",
+   "closed": 2015,
+   "note": "cooling towers demolished 2024"
+  },
+  {
+   "name": "Rancho Seco Nuclear Generating Station",
+   "cc": "USA",
+   "lat": 38.345,
+   "lon": -121.122,
+   "fuel": "N",
+   "mw": 913,
+   "state": "standing",
+   "closed": 1989,
+   "note": "closed 1989; its two cooling towers still stand"
+  },
+  {
+   "name": "Kalkar (SNR-300, Wunderland Kalkar)",
+   "cc": "DEU",
+   "lat": 51.763,
+   "lon": 6.329,
+   "fuel": "N",
+   "mw": 327,
+   "state": "standing",
+   "closed": 1991,
+   "note": "never operated; its cooling tower stands in an amusement park"
+  },
+  {
+   "name": "Intermountain Power Project",
+   "cc": "USA",
+   "lat": 39.505,
+   "lon": -112.58,
+   "fuel": "C",
+   "state": "closed",
+   "closed": 2025,
+   "note": "EIA: units 1 and 2 retired Oct-Nov 2025"
+  },
+  {
+   "name": "Indian River Generating Station",
+   "cc": "USA",
+   "lat": 38.586,
+   "lon": -75.235,
+   "fuel": "C",
+   "state": "closed",
+   "closed": 2025,
+   "note": "EIA: unit 4 retired Feb 2025"
+  },
+  {
+   "name": "Cholla",
+   "cc": "USA",
+   "lat": 34.94,
+   "lon": -110.3,
+   "fuel": "C",
+   "state": "closed",
+   "closed": 2025,
+   "note": "EIA: units 1 and 3 retired Mar 2025"
+  },
+  {
+   "name": "Drax",
+   "cc": "GBR",
+   "lat": 53.7356,
+   "lon": -0.9911,
+   "fuel": "C",
+   "state": "running",
+   "note": "coal units converted to biomass: still running"
+  },
+  {
+   "name": "Ratcliffe-on-Soar",
+   "cc": "GBR",
+   "lat": 52.8653,
+   "lon": -1.255,
+   "fuel": "C",
+   "state": "closed",
+   "closed": 2024,
+   "note": "the UK's last coal plant, closed Sept 2024; still standing"
+  }
+ ]
+}

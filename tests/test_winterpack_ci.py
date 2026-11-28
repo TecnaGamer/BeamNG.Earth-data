@@ -198,5 +198,82 @@ class CellsTest(unittest.TestCase):
         self.assertEqual((land[210], land[0], land[10]), (0, 0, 1))
 
 
+@unittest.skipIf(np is None, "numpy")
+class PowerPlantsTest(unittest.TestCase):
+    """The power plants' index (powerplants.yml): its npz's members, headers and counts."""
+
+    def art(self, root, plants=6000, structs=12000, extra=None, drop=None, version="v4"):
+        d = os.path.join(root, "powerplants")
+        os.makedirs(d)
+        cols = {}
+        for k, (descr, n_of) in ci.PP_COLUMNS.items():
+            n = {"p": plants, "s": structs, "p1": plants + 1, "one": 1, "any": 3 * plants}[n_of]
+            cols[k] = np.zeros(n, np.dtype(descr))
+        cols["p_name_off"] = np.arange(plants + 1, dtype=np.int32) * 3
+        if extra:
+            cols.update(extra)
+        for k in drop or ():
+            cols.pop(k)
+        path = os.path.join(d, "power_plants.npz")
+        with open(path, "wb") as f:
+            np.savez_compressed(f, **cols)
+        body = open(path, "rb").read()
+        m = {"format": 1, "name": "powerplants", "version": version, "build": hashlib.sha256(body).hexdigest()[:16],
+             "built": "2026-11-28T00:00:00Z", "attribution": "(c) OpenStreetMap contributors and the others " * 2,
+             "plants": plants, "structures": structs,
+             "files": [{"path": "power_plants.npz", "size": len(body), "sha256": hashlib.sha256(body).hexdigest()}]}
+        with open(os.path.join(d, "manifest.json"), "w") as f:
+            json.dump(m, f)
+        with open(os.path.join(d, "ATTRIBUTION.md"), "w") as f:
+            f.write("# x\n\n" + "Derived from OpenStreetMap contributors' data. " * 10)
+        return root
+
+    def run_ci(self, *argv):
+        try:
+            ci.main(list(argv))
+        except SystemExit as e:
+            return e.code
+        return 0
+
+    def test_a_good_build_passes(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(self.run_ci("check", self.art(t), "powerplants"), 0)
+
+    def test_a_missing_or_extra_column_is_refused(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(self.run_ci("check", self.art(t, drop=["s_plant"]), "powerplants"), 1)
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(self.run_ci("check", self.art(t, extra={"evil": np.zeros(3, np.int8)}), "powerplants"), 1)
+
+    def test_a_wrong_length_or_dtype_is_refused(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(self.run_ci("check", self.art(t, extra={"s_lat": np.zeros(5, np.int32)}), "powerplants"), 1)
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(self.run_ci("check", self.art(t, extra={"p_mw": np.zeros(6000, np.float64)}),
+                                         "powerplants"), 1)
+
+    def test_a_cut_off_build_is_refused(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(self.run_ci("check", self.art(t, plants=100), "powerplants"), 1)
+
+    def test_next_version(self):
+        with tempfile.TemporaryDirectory() as t:
+            f = os.path.join(t, "cdn.json")
+            with open(f, "w") as fh:
+                fh.write('{"nbiskew": {"enabled": true, "version": "v1"}}')
+            import contextlib
+            import io
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                ci.main(["next-version", f, "powerplants"])
+            self.assertEqual(out.getvalue().strip(), "v1")
+            with open(f, "w") as fh:
+                fh.write('{"powerplants": {"enabled": true, "version": "v41"}}')
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                ci.main(["next-version", f, "powerplants"])
+            self.assertEqual(out.getvalue().strip(), "v42")
+
+
 if __name__ == "__main__":
     unittest.main()
