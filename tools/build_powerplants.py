@@ -374,6 +374,10 @@ def read_structures(osm_dir):
             continue
         with open(os.path.join(osm_dir, name), encoding="utf-8") as f:
             d = json.load(f)
+        lo_, hi_ = band_of(name)
+        bad = band_problems(d, lo_, hi_)       # (a band file holds only its band's elements, however it was fetched)
+        if bad:
+            sys.exit(f"{name}: {len(bad)} elements outside its band, e.g. {bad[:3]}")
         for e in d.get("elements", ()):
             tags = e.get("tags") or {}
             if any(DEMOLISHED.match(k) for k in tags) or tags.get("disused:man_made") or tags.get("end_date"):
@@ -634,23 +638,75 @@ def build(inputs, osm_dir, out=OUT):
 
 
 # --- the weekly data-repo build (BeamNG.Earth-data .github/workflows/powerplants.yml) ----------------------------------
-OVERPASS = ("https://overpass-api.de/api/interpreter", "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
-            "https://overpass.kumi.systems/api/interpreter")
-OVERPASS_HOSTS = {"overpass-api.de", "maps.mail.ru", "overpass.kumi.systems"}
+# The Overpass API's main instance only (no mirrors: one operator's data and rate policy). Its usage policy: no more than
+# one request at a time, waits between requests, back off on 429 / 504 (Retry-After honoured).
+OVERPASS = "https://overpass-api.de/api/interpreter"
+OVERPASS_HOST = "overpass-api.de"
+OVERPASS_GAP_S = 30.0           # s between two bands
+OVERPASS_BACKOFF_S = (60, 120, 240, 480, 900, 900, 900, 900)
 BAND_DEG = 15
 MAX_BAND_BYTES = 256 << 20
+EDGE_EPS = 1e-6                 # degrees: a node on a band's edge is the band's
 # Plants any build must hold (validate): (name word, lat, lon, fuel letter, mapped cooling towers at least)
 ANCHORS = (("drax", 53.737, -0.997, "B", 12), ("gavin", 38.935, -82.116, "C", 2), ("cattenom", 49.416, 6.218, "N", 4),
            ("niederau", 50.996, 6.670, "C", 6), ("irsching", 48.766, 11.584, "G", 0))
-GROWTH = (0.9, 1.15)        # a build's plants and structures against the published one's: at most this much change
+# A build against its baseline (the served published build; for the first release, the index bundled with the app):
+GROWTH = (0.9, 1.15)            # the whole index's plants and structures: at most this much change
+REGION_MIN = 50                 # a region (a BAND_DEG band, by latitude halves) with this many rows at least ...
+REGION_GROWTH = (0.85, 1.20)    # ... changes at most this much, ...
+REGION_SMALL_ABS = 25           # ... a smaller one at most this many rows
+ID_REMOVED_MAX = 0.05           # of the baseline's OSM structures: at most this share gone ...
+ID_MOVED_MAX = 0.02             # ... or moved more than MOVED_M ...
+ID_ADDED_MAX = 0.10             # ... and at most this share new
+REGION_ID_MAX = 0.15            # per region (REGION_MIN rows at least): removed + moved at most this share
+MOVED_M = 200.0
 
 
-def fetch_osm(out_dir, tries=9, wait_s=90):
-    """The Overpass export of the mapped chimneys and cooling towers, one file per BAND_DEG of longitude (out tags bb),
-    each checked as JSON with no runtime error remark; mirrors in turn, waits between tries. Exits on a band that never
-    came."""
+def band_problems(doc, lo, hi):
+    """What in one Overpass answer (out tags bb) lies outside its query band [lo, hi] of longitude: a node off the band,
+    a way / relation whose box does not reach it, coordinates that are no coordinates. [] when it is all the band's."""
+    out = []
+    for e in doc.get("elements", ()):
+        if not isinstance(e, dict):
+            out.append("an element that is no object")
+            continue
+        t = e.get("type")
+        try:
+            if t == "node":
+                la, lo_ = float(e["lat"]), float(e["lon"])
+                if not (-90 <= la <= 90 and lo - EDGE_EPS <= lo_ <= hi + EDGE_EPS):
+                    out.append(f"node {e.get('id')} at {la},{lo_}")
+            elif t in ("way", "relation"):
+                b = e.get("bounds")
+                if not isinstance(b, dict):
+                    continue            # (no box: no position; read_structures leaves it out)
+                a0, a1, o0, o1 = (float(b["minlat"]), float(b["maxlat"]), float(b["minlon"]), float(b["maxlon"]))
+                if not (-90 <= a0 <= a1 <= 90 and o0 <= o1 and o0 <= hi + EDGE_EPS and o1 >= lo - EDGE_EPS):
+                    out.append(f"{t} {e.get('id')} box {a0},{o0} {a1},{o1}")
+            else:
+                out.append(f"an element of type {t!r}")
+        except (KeyError, TypeError, ValueError):
+            out.append(f"{t} {e.get('id')}: no coordinates")
+    return out
+
+
+def band_of(name):
+    m = re.fullmatch(r"band_(-?\d+)\.json", name)
+    lo = int(m.group(1)) if m else None
+    if lo is None or lo % BAND_DEG or not -180 <= lo < 180:
+        raise ValueError(f"{name}: not a band file")
+    return lo, lo + BAND_DEG
+
+
+def fetch_osm(out_dir, tries=len(OVERPASS_BACKOFF_S) + 1, sleep=None):
+    """The Overpass export of the mapped chimneys and cooling towers, one file per BAND_DEG of longitude (out tags bb)
+    from the main instance, one request at a time: each answer checked (JSON, no runtime error remark, every element in
+    its band: band_problems) before it is kept. Exits on a band that never came right."""
     import time
+    from urllib.error import HTTPError
     from urllib.parse import urlencode, urlparse
+    sleep = sleep or time.sleep
+    assert urlparse(OVERPASS).hostname == OVERPASS_HOST
     os.makedirs(out_dir, exist_ok=True)
     for lo in range(-180, 180, BAND_DEG):
         hi = lo + BAND_DEG
@@ -659,10 +715,9 @@ def fetch_osm(out_dir, tries=9, wait_s=90):
              f'nwr["man_made"="cooling_tower"](-90,{lo},90,{hi});nwr["tower:type"="cooling"](-90,{lo},90,{hi}););'
              f'out tags bb;')
         for k in range(tries):
-            url = OVERPASS[k % len(OVERPASS)]
-            assert urlparse(url).hostname in OVERPASS_HOSTS
+            wait = None
             try:
-                req = urllib.request.Request(url, data=urlencode({"data": q}).encode(),
+                req = urllib.request.Request(OVERPASS, data=urlencode({"data": q}).encode(),
                                              headers={"User-Agent": "BeamNG.Earth-data-build"})
                 with urllib.request.urlopen(req, timeout=900) as r:
                     body = r.read(MAX_BAND_BYTES + 1)
@@ -674,16 +729,26 @@ def fetch_osm(out_dir, tries=9, wait_s=90):
                     raise ValueError(remark[:200])
                 if not isinstance(d.get("elements"), list):
                     raise ValueError("no elements")
+                bad = band_problems(d, lo, hi)
+                if bad:
+                    raise ValueError(f"{len(bad)} elements outside the band, e.g. {bad[:3]}")
                 with open(out + ".part", "wb") as f:
                     f.write(body)
                 os.replace(out + ".part", out)
                 print(f"band {lo}: {len(d['elements'])} elements", flush=True)
                 break
-            except Exception as e:      # (a busy server: the next mirror, later)
-                print(f"band {lo} try {k + 1}: {type(e).__name__}: {str(e)[:160]}", flush=True)
-                time.sleep(wait_s)
+            except HTTPError as e:
+                ra = e.headers.get("Retry-After") if e.headers else None
+                if ra and ra.isdigit():
+                    wait = min(int(ra), 1800)
+                print(f"band {lo} try {k + 1}: HTTP {e.code}", flush=True)
+            except Exception as e:      # (busy, cut off, or an answer that did not check: later, never kept)
+                print(f"band {lo} try {k + 1}: {type(e).__name__}: {str(e)[:200]}", flush=True)
+            if k + 1 < tries:
+                sleep(wait if wait is not None else OVERPASS_BACKOFF_S[min(k, len(OVERPASS_BACKOFF_S) - 1)])
         else:
-            sys.exit(f"band {lo}: no answer after {tries} tries")
+            sys.exit(f"band {lo}: no good answer after {tries} tries")
+        sleep(OVERPASS_GAP_S)
 
 
 def stage(inputs, osm_dir, out_dir, version):
@@ -707,18 +772,83 @@ def stage(inputs, osm_dir, out_dir, version):
     return m
 
 
-def validate(out_dir, previous=None):
-    """A staged build checked before it may be published: the npz's columns (the server's own reader rules), the
-    anchors (ANCHORS: known plants with their mapped towers), and its counts against the published build's manifest
-    (previous: within GROWTH). Exits non-zero with the reasons."""
+def _load_npz(path):
+    with np.load(path, allow_pickle=False) as z:
+        return {k: np.array(z[k]) for k in z.files}
+
+
+def _region(lat, lon):
+    """The region of points (arrays, degrees): the BAND_DEG band of longitude, north / south (an int each)."""
+    band = np.floor((np.asarray(lon, np.float64) + 180.0) / BAND_DEG).astype(np.int64) % (360 // BAND_DEG)
+    return band * 2 + (np.asarray(lat) >= 0)
+
+
+def compare(new, base):
+    """[reason] for a build against its baseline (both npz dicts): the whole index's counts (GROWTH), each region's
+    plants and structures (REGION_*), and the OSM structures by id: removed, moved over MOVED_M, added (ID_*), overall
+    and per region. [] when nothing is out of bounds. Prints the region table."""
     bad = []
+    for key, lat, lon in (("plants", "p_lat", "p_lon"), ("structures", "s_lat", "s_lon")):
+        nb, nn = len(base[lat]), len(new[lat])
+        r = nn / max(1, nb)
+        if not GROWTH[0] <= r <= GROWTH[1]:
+            bad.append(f"{key}: {nn} against the baseline's {nb} ({r:.3f}x)")
+        rb = np.bincount(_region(base[lat] / 1e6, base[lon] / 1e6), minlength=48)
+        rn = np.bincount(_region(new[lat] / 1e6, new[lon] / 1e6), minlength=48)
+        for g in range(48):
+            b_, n_ = int(rb[g]), int(rn[g])
+            name = f"{key} region {(g // 2) * BAND_DEG - 180}..{(g // 2) * BAND_DEG - 165}E {'N' if g % 2 else 'S'}"
+            if b_ >= REGION_MIN:
+                if not REGION_GROWTH[0] <= n_ / b_ <= REGION_GROWTH[1]:
+                    bad.append(f"{name}: {n_} against {b_}")
+            elif abs(n_ - b_) > REGION_SMALL_ABS:
+                bad.append(f"{name}: {n_} against {b_}")
+    # the OSM structures by element
+    def ids(d):
+        k = d["s_osm"] > 0
+        key = d["s_osm"][k].astype(np.int64) * 4 + d["s_osm_type"][k].astype(np.int64)
+        return key, d["s_lat"][k] / 1e6, d["s_lon"][k] / 1e6
+    kb, la_b, lo_b = ids(base)
+    kn, la_n, lo_n = ids(new)
+    ob, on = np.argsort(kb, kind="stable"), np.argsort(kn, kind="stable")
+    kb, la_b, lo_b, kn, la_n, lo_n = kb[ob], la_b[ob], lo_b[ob], kn[on], la_n[on], lo_n[on]
+    common, ib, in_ = np.intersect1d(kb, kn, assume_unique=False, return_indices=True)
+    removed = np.ones(len(kb), bool)
+    removed[ib] = False
+    added = np.ones(len(kn), bool)
+    added[in_] = False
+    dy = (la_n[in_] - la_b[ib]) * 110540.0
+    dx = (lo_n[in_] - lo_b[ib]) * 111320.0 * np.cos(np.radians(la_b[ib]))
+    moved = np.zeros(len(kb), bool)
+    moved[ib] = np.hypot(dx, dy) > MOVED_M
+    nb = max(1, len(kb))
+    for what, count, top in (("removed", int(removed.sum()), ID_REMOVED_MAX), ("moved", int(moved.sum()), ID_MOVED_MAX),
+                             ("added", int(added.sum()), ID_ADDED_MAX)):
+        print(f"structures {what}: {count} of {len(kb)} ({count / nb:.2%})")
+        if count / nb > top:
+            bad.append(f"structures {what}: {count} of {len(kb)} ({count / nb:.2%}, over {top:.0%})")
+    rg = _region(la_b, lo_b)
+    per_all = np.bincount(rg, minlength=48)
+    per_out = np.bincount(rg[removed | moved], minlength=48)
+    for g in range(48):
+        if per_all[g] >= REGION_MIN and per_out[g] / per_all[g] > REGION_ID_MAX:
+            bad.append(f"structures region {(g // 2) * BAND_DEG - 180}E {'N' if g % 2 else 'S'}: "
+                       f"{int(per_out[g])} of {int(per_all[g])} removed or moved")
+    return bad
+
+
+def validate(out_dir, previous=None, baseline=None):
+    """A staged build checked before it may be published: the npz's columns (the server's own reader rules), the
+    anchors (ANCHORS: known plants with their mapped towers), its manifest's counts against the served manifest
+    (previous) and the whole build against a trusted baseline npz (baseline: the served build, else the index bundled
+    with the app; compare). Exits 1 (a broken build) or 2 (large changes: held for review) with the reasons."""
+    bad, review = [], []
     with open(os.path.join(out_dir, "manifest.json"), encoding="utf-8") as f:
         m = json.load(f)
     npz = os.path.join(out_dir, "power_plants.npz")
     if sha256(npz) != m["files"][0]["sha256"] or os.path.getsize(npz) != m["files"][0]["size"]:
         bad.append("the npz is not the manifest's")
-    with np.load(npz, allow_pickle=False) as z:
-        d = {k: np.array(z[k]) for k in z.files}
+    d = _load_npz(npz)
     for key, prefix in (("p_lat", "p_"), ("s_lat", "s_")):     # (the server's reader rules: powerplants.validate)
         rows = len(d[key])
         if any(len(v) != rows for c, v in d.items() if c.startswith(prefix) and c != "p_name_off") \
@@ -750,12 +880,20 @@ def validate(out_dir, previous=None):
         for key in ("plants", "structures"):
             r = m[key] / max(1, pm[key])
             if not GROWTH[0] <= r <= GROWTH[1]:
-                bad.append(f"{key}: {m[key]} against the published {pm[key]} ({r:.3f}x)")
+                review.append(f"{key}: {m[key]} against the published {pm[key]} ({r:.3f}x)")
+    if baseline is None:
+        bad.append("no baseline to compare with")
+    else:
+        review += compare(d, _load_npz(baseline))
     for b in bad:
         print("REFUSED:", b)
+    for b in review:
+        print("REVIEW:", b)
     if bad:
         sys.exit(1)
-    print(f"ok: {n} plants, {k} structures, every anchor")
+    if review:
+        sys.exit(2)
+    print(f"ok: {n} plants, {k} structures, every anchor, within the baseline's bounds")
 
 
 if __name__ == "__main__":
@@ -773,6 +911,7 @@ if __name__ == "__main__":
         p_ = sub.add_parser("validate")
         p_.add_argument("out_dir")
         p_.add_argument("--previous")
+        p_.add_argument("--baseline", required=True)
         a = ap.parse_args()
         if a.cmd == "fetch-osm":
             fetch_osm(a.out_dir)
@@ -783,7 +922,7 @@ if __name__ == "__main__":
                 fetch(a.inputs)
             print(json.dumps(stage(a.inputs, a.osm, a.out, a.version)))
         else:
-            validate(a.out_dir, a.previous)
+            validate(a.out_dir, a.previous, a.baseline)
         sys.exit(0)
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--inputs", required=True)

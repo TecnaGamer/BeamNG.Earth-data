@@ -16,8 +16,9 @@ its hand-checked list `tools/data/power_plants_manual.json`:
 
 - OpenStreetMap's power=plant through GMWID's latest build (only its latest is published: its hash and version are in
   the run's provenance artifact), with EIA-860M's US plants OSM lacks;
-- OpenStreetMap's mapped chimneys and cooling towers from the Overpass API (15-degree longitude bands, three public
-  instances in turn, retried);
+- OpenStreetMap's mapped chimneys and cooling towers from the Overpass API's main instance only (overpass-api.de:
+  15-degree longitude bands, one request at a time, 30 s apart, backing off on 429 / 504 and honouring Retry-After);
+  every answer's elements are checked against their band before it is kept, and again when the build reads them;
 - GPPD v1.3.0, GEM's coal tracker, GeoNuclearData and powerplantmatching at pinned commits, their SHA-256 checked.
 
 Deterministic: the workflow stages the index twice from the same inputs and compares the npz byte for byte.
@@ -27,13 +28,23 @@ Deterministic: the workflow stages the index twice from the same inputs and comp
 `.github/workflows/powerplants.yml`: Saturdays 05:41 UTC, and by hand (Actions -> powerplants -> Run workflow;
 `dry_run` defaults to true: plan and build only).
 
-1. **plan**: the version `cdn.json` serves and the next one (v1, v2, ...), the served manifest from the CDN.
-2. **build** (no secrets): inputs, Overpass bands, the index twice (byte-compared), `validate`: the server reader's
-   rules, the anchor plants (Drax, Gavin, Cattenom, Niederaussem, Irsching) with their mapped cooling towers, and the
-   plant and structure counts within 0.9-1.15x of the served build. A build identical to the served one stops here.
-3. **publish** (R2 secrets; only `tools/winterpack_ci.py`, standard library, and aws-cli): the files uploaded once
-   (immutable, a published version is never rewritten), the manifest last.
-4. **live**: the CDN's copy compared byte for byte.
+1. **plan**: the version `cdn.json` serves and its manifest from the CDN.
+2. **build** (no secrets): inputs, Overpass bands, the index twice (byte-compared), then `validate` against a trusted
+   baseline: the served build (its file from the CDN, checked against the served manifest) or, for the first release,
+   the app's bundled index pinned here (`tools/data/power_plants_baseline.npz` and its SHA-256 in
+   `power_plants_baseline.json`). It checks the server reader's rules, the anchor plants (Drax, Gavin, Cattenom,
+   Niederaussem, Irsching) with their mapped cooling towers, the plant and structure counts overall (0.9-1.15x) and per
+   region (15-degree bands, north / south: 0.85-1.2x), and the OSM structures by element: at most 5 % removed, 2 %
+   moved over 200 m, 10 % added, 15 % removed or moved in a region. Over those bounds the build is **held for review**:
+   nothing is published and the run opens an issue. A build identical to the served one stops here.
+3. **publish** (R2 secrets; only `tools/winterpack_ci.py`, standard library, and aws-cli): the whole `powerplants/`
+   prefix is listed and the release's version allocated from it (`allocate`): a version already holding this build
+   complete is activated again as published (its own manifest; nothing uploaded), one holding this build's file
+   without a manifest (an upload cut off) is finished, and otherwise the release takes a new version past every one
+   the bucket or `cdn.json` has used. A published or half-published version is never written with another build, so a
+   failed CDN check or flip, or a rollback of `cdn.json`, never wedges the next week's run. The files are uploaded once
+   (immutable), the manifest last.
+4. **live**: the CDN's copy compared byte for byte with the release.
 5. **flip** (contents write; the checker and git only): `cdn.json`'s `{"powerplants": {"enabled": true, "version":
    "vN"}}` by a minimal edit, only if it still names the version the plan read. Players' servers pick it up at their
    next start.

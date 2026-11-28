@@ -38,6 +38,15 @@ bucket is only compared (state=published); a change needs a new version. Nothing
                           manifest.json and the files (watershare: N of them, spread evenly, and the largest) fetched
                           through the CDN and compared byte for byte with the artifact
   next-version FILE PACK  the version after the one cdn.json's PACK key names (v1 when it names none)
+  allocate ART PACK --listing L [--served V]
+                          L: aws s3api list-objects-v2 of the whole PACK/ prefix (every version, partial ones too).
+                          Prints "reuse vN" when vN holds this build complete (its single file there with the
+                          artifact's size and MD5 ETag, and a manifest: the release is activated again as published),
+                          "resume vN" when vN holds this build's file but no manifest (an upload cut off: finished
+                          there), else "new vM" past every version the bucket or cdn.json (V) has used: a published or
+                          half-published version is never written with another build
+  restamp ART PACK VERSION
+                          the artifact's manifest's version set to VERSION (nothing else changes), checked again
   cdn-key FILE PACK VERSION
                           cdn.json's PACK key set to {"enabled": true, "version": VERSION} by a minimal text edit (every
                           other key byte-identical), checked by parsing both
@@ -501,6 +510,65 @@ def cmd_cdn_key(a):
     print(f"{a.file}: {a.pack} {a.version}")
 
 
+def _md5_file(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def cmd_allocate(a):
+    """The version this build goes to (see the doc): reuse / resume / new."""
+    root = os.path.join(a.art, a.pack)
+    m, _ = load_manifest(root, a.pack)
+    want = files_of(m, a.pack)
+    if len(want) != 1:
+        refuse("allocate: single-file packs only")
+    (fname, (size, _sha)), = want.items()
+    md5 = _md5_file(os.path.join(root, fname))
+    with open(a.listing, encoding="utf-8") as f:
+        txt = f.read()
+    d = json.loads(txt) if txt.strip() else {}
+    seen = {}                       # version number -> {file: (size, etag)}
+    for o in d.get("Contents") or []:
+        k = str(o.get("Key", ""))
+        mm = re.fullmatch(re.escape(a.pack) + r"/(v[1-9][0-9]{0,3})/([A-Za-z0-9_.-]+)", k)
+        if not mm:
+            refuse(f"listing: key {k!r} outside {a.pack}/<version>/")
+        seen.setdefault(int(mm.group(1)[1:]), {})[mm.group(2)] = (int(o.get("Size", -1)),
+                                                                  str(o.get("ETag", "")).strip('"').lower())
+    for n in sorted(seen):
+        f = seen[n].get(fname)
+        if f and f[0] == size and f[1] == md5:
+            print(("reuse" if "manifest.json" in seen[n] else "resume") + f" v{n}")
+            return
+    top = max(list(seen) + [0])
+    if a.served:
+        if not VERSION_RE.fullmatch(a.served):
+            refuse(f"served version {a.served!r}")
+        top = max(top, int(a.served[1:]))
+    if top + 1 > 9999:
+        refuse("no version left")
+    print(f"new v{top + 1}")
+
+
+def cmd_restamp(a):
+    """The artifact's manifest's version set to a.version, nothing else."""
+    if not VERSION_RE.fullmatch(a.version):
+        refuse(f"version {a.version!r}")
+    root = os.path.join(a.art, a.pack)
+    m, raw = load_manifest(root, a.pack)
+    m["version"] = a.version
+    path = os.path.join(root, "manifest.json")
+    with open(path + ".tmp", "w", encoding="utf-8", newline="\n") as f:
+        json.dump(m, f, indent=1, sort_keys=True)
+        f.write("\n")
+    os.replace(path + ".tmp", path)
+    a2 = argparse.Namespace(art=a.art, pack=a.pack, min=PACKS[a.pack]["min"])
+    cmd_check(a2)
+
+
 def cmd_next_version(a):
     """The version after the one cdn.json's PACK key names (v1 when none)."""
     with open(a.file, encoding="utf-8") as f:
@@ -539,6 +607,15 @@ def main(argv=None):
     p.add_argument("pack", choices=sorted(PACKS))
     p.add_argument("--base", required=True)
     p.add_argument("--sample", type=int, default=40)
+    p = sub.add_parser("allocate")
+    p.add_argument("art")
+    p.add_argument("pack", choices=sorted(PACKS))
+    p.add_argument("--listing", required=True)
+    p.add_argument("--served", default="")
+    p = sub.add_parser("restamp")
+    p.add_argument("art")
+    p.add_argument("pack", choices=sorted(PACKS))
+    p.add_argument("version")
     p = sub.add_parser("next-version")
     p.add_argument("file")
     p.add_argument("pack", choices=sorted(PACKS))
@@ -560,6 +637,10 @@ def main(argv=None):
             cmd_live(a)
         elif a.cmd == "next-version":
             cmd_next_version(a)
+        elif a.cmd == "allocate":
+            cmd_allocate(a)
+        elif a.cmd == "restamp":
+            cmd_restamp(a)
         else:
             cmd_cdn_key(a)
     except (Refused, OSError, ValueError, KeyError, TypeError) as e:

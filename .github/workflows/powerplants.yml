@@ -2,25 +2,30 @@
 # README-powerplants.md), rebuilt every week:
 #   powerplants/<version>/   the world's thermal power plants and their mapped cooling towers and chimneys, one npz
 #                            (tools/build_powerplants.py, a pinned copy of BeamNG.Earth's: OpenStreetMap through GMWID
-#                            and the Overpass API, GPPD, GEM, GeoNuclearData, powerplantmatching; ODbL)
+#                            and the Overpass API's main instance, GPPD, GEM, GeoNuclearData, powerplantmatching; ODbL)
 # Players' servers read the version cdn.json names ({"powerplants": {"enabled": true, "version": "vN"}}: the map layer
 # and the plant stream; the bundled index otherwise, and always for the building tiles). The flip job writes that key
 # LAST, only after the build was validated, published and fetched back through the CDN byte for byte.
 #
-#   plan     [no secrets] the version cdn.json serves, the next one (v1 when none), the served manifest (the growth
-#            check's reference) fetched from the CDN
+#   plan     [no secrets] the version cdn.json serves and its manifest (from the CDN)
 #   build    [no secrets] the pinned inputs (tools/build_powerplants.py PINNED: their SHA-256 checked; GMWID's latest
-#            recorded in the provenance), the Overpass bands, the index staged twice and byte-compared (deterministic),
-#            validated (the server reader's rules, the anchor plants with their mapped towers, the plant and structure
-#            counts within 0.9-1.15x of the served build), checked by tools/winterpack_ci.py; a build byte-identical to
-#            the served one stops here (nothing to publish); the staged folder as the artifact powerplants-build
-#   publish  [R2 secrets: this repo's stdlib checker and aws-cli only; main only; not on dry runs] the artifact checked
-#            again, powerplants/<version>/ listed (a key not of the index, or one with another size, refuses: a
-#            published version is never rewritten), the files uploaded (immutable), manifest.json last
-#   live     [no secrets] manifest.json and the npz fetched through the CDN, byte-compared
-#   flip     [contents write: this repo's stdlib checker and git only] cdn.json's powerplants key to the new version by
-#            a minimal edit (other keys byte-identical), only if it still names the version plan read; committed to main
-#   notify   [issues write] one issue when a job failed (nothing flipped; the next weekly run tries again)
+#            recorded in the provenance), the Overpass bands (overpass-api.de only, one request at a time with its back-off;
+#            every answer's elements checked against their band), the index staged twice and byte-compared, then
+#            validated against a trusted baseline: the served build (its file from the CDN, checked against the served
+#            manifest) or, for the first release, the app's bundled index pinned here (tools/data/power_plants_baseline.*):
+#            the server reader's rules, the anchor plants with their mapped towers, the counts overall and per region,
+#            and the OSM structures by id (removed, moved, added). Large changes hold the build for review (the job fails,
+#            nothing is published, notify opens an issue). A build byte-identical to the served one stops here.
+#   publish  [R2 secrets: this repo's stdlib checker and aws-cli only; main only; not on dry runs] the whole
+#            powerplants/ prefix listed (every version, partial ones too); the release's version allocated from it
+#            (winterpack_ci.py allocate): a version holding this build complete is activated again as published (its own
+#            manifest), one holding this build's file without a manifest is finished, else a new version past every one
+#            used (never a published or half-published one): the files uploaded (immutable), manifest.json last; the
+#            release (the artifact with its final manifest) handed on as powerplants-release
+#   live     [no secrets] manifest.json and the npz fetched through the CDN, byte-compared with the release
+#   flip     [contents write: this repo's stdlib checker and git only] cdn.json's powerplants key to the release's
+#            version by a minimal edit, only if it still names the version plan read; committed to main
+#   notify   [issues write] one issue when a job failed or a build was held for review (nothing flipped)
 # Inputs (by hand): dry_run (default true: plan and build only).
 # Secrets (repo settings): R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.
 name: powerplants
@@ -53,7 +58,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      version: ${{ steps.p.outputs.version }}
       served: ${{ steps.p.outputs.served }}
       served_build: ${{ steps.p.outputs.served_build }}
     steps:
@@ -61,34 +65,34 @@ jobs:
         with:
           persist-credentials: false
       - id: p
-        name: "The served version, the next one, the served manifest"
+        name: "The served version and its manifest"
         run: |
           set -euo pipefail
-          NEXT=$(python3 -I tools/winterpack_ci.py next-version cdn.json powerplants)
-          [[ "$NEXT" =~ ^v[1-9][0-9]{0,3}$ ]] || { echo "::error::bad next version: $NEXT"; exit 1; }
           SERVED=$(python3 -I -c 'import json; d = json.load(open("cdn.json")); v = (d.get("powerplants") or {}).get("version") or ""; print(v)')
           [[ -z "$SERVED" || "$SERVED" =~ ^v[1-9][0-9]{0,3}$ ]] || { echo "::error::bad served version: $SERVED"; exit 1; }
           BUILD=""
+          mkdir -p served
           if [ -n "$SERVED" ]; then
-            curl -fsS --max-time 60 --max-filesize 4194304 -o served.json "$CDN/powerplants/$SERVED/manifest.json"
-            BUILD=$(python3 -I -c 'import json, re; b = str(json.load(open("served.json")).get("build")); print(b if re.fullmatch("[0-9a-f]{16}", b) else "")')
+            curl -fsS --max-time 60 --max-filesize 4194304 -o served/manifest.json "$CDN/powerplants/$SERVED/manifest.json"
+            BUILD=$(python3 -I -c 'import json, re; b = str(json.load(open("served/manifest.json")).get("build")); print(b if re.fullmatch("[0-9a-f]{16}", b) else "")')
             [ -n "$BUILD" ] || { echo "::error::the served manifest has no build"; exit 1; }
           fi
-          { echo "version=$NEXT"; echo "served=$SERVED"; echo "served_build=$BUILD"; } >> "$GITHUB_OUTPUT"
-          echo "served: ${SERVED:-none} ${BUILD}; next: $NEXT" | tee -a "$GITHUB_STEP_SUMMARY"
+          { echo "served=$SERVED"; echo "served_build=$BUILD"; } >> "$GITHUB_OUTPUT"
+          echo "served: ${SERVED:-none} ${BUILD}" | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
         if: ${{ steps.p.outputs.served != '' }}
         with:
           name: powerplants-served
-          path: served.json
+          path: served
           retention-days: 7
 
   build:
     needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 300
     outputs:
       same: ${{ steps.b.outputs.same }}
+      held: ${{ steps.b.outputs.held }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
         with:
@@ -101,23 +105,48 @@ jobs:
         if: ${{ needs.plan.outputs.served != '' }}
         with:
           name: powerplants-served
-          path: prev
+          path: served
+      - name: "The baseline: the served build (checked against its manifest), else the pinned bundled index"
+        env:
+          SERVED: ${{ needs.plan.outputs.served }}
+        run: |
+          set -euo pipefail
+          mkdir -p base
+          if [ -n "$SERVED" ]; then
+            read -r SIZE SHA < <(python3 -I -c 'import json; f = json.load(open("served/manifest.json"))["files"][0]; print(int(f["size"]), f["sha256"])')
+            [[ "$SHA" =~ ^[0-9a-f]{64}$ && "$SIZE" =~ ^[0-9]{1,9}$ ]] || { echo "::error::the served manifest's file"; exit 1; }
+            curl -fsS --max-time 300 --max-filesize "$SIZE" -o base/power_plants.npz "$CDN/powerplants/$SERVED/power_plants.npz"
+          else
+            SHA=$(python3 -I -c 'import json; print(json.load(open("tools/data/power_plants_baseline.json"))["sha256"])')
+            cp tools/data/power_plants_baseline.npz base/power_plants.npz
+          fi
+          echo "$SHA  base/power_plants.npz" | sha256sum -c -
+          echo "baseline: ${SERVED:-the bundled index} ($SHA)" | tee -a "$GITHUB_STEP_SUMMARY"
       - id: b
         name: "The inputs, the Overpass bands, the index built twice, validated, staged and checked"
         env:
-          VERSION: ${{ needs.plan.outputs.version }}
           SERVED_BUILD: ${{ needs.plan.outputs.served_build }}
         run: |
           set -euo pipefail
-          [[ "$VERSION" =~ ^v[1-9][0-9]{0,3}$ ]] || { echo "::error::bad version: $VERSION"; exit 1; }
+          echo "held=false" >> "$GITHUB_OUTPUT"
           mkdir -p src osm art/powerplants
           python tools/build_powerplants.py fetch-osm osm
-          python tools/build_powerplants.py stage --fetch --inputs src --osm osm --out build --version "$VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
-          python tools/build_powerplants.py stage --inputs src --osm osm --out build2 --version "$VERSION" > /dev/null
+          # (v1: a placeholder, the publish job sets the release's version: winterpack_ci.py allocate / restamp)
+          python tools/build_powerplants.py stage --fetch --inputs src --osm osm --out build --version v1 | tee -a "$GITHUB_STEP_SUMMARY"
+          python tools/build_powerplants.py stage --inputs src --osm osm --out build2 --version v1 > /dev/null
           cmp build/power_plants.npz build2/power_plants.npz || { echo "::error::two builds differ"; exit 1; }
           PREV=()
-          [ -f prev/served.json ] && PREV=(--previous prev/served.json)
-          python tools/build_powerplants.py validate build "${PREV[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ -f served/manifest.json ] && PREV=(--previous served/manifest.json)
+          rc=0
+          python tools/build_powerplants.py validate build "${PREV[@]}" --baseline base/power_plants.npz > validate.txt || rc=$?
+          { echo '```'; cat validate.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          cat validate.txt
+          if [ "$rc" = 2 ]; then
+            echo "held=true" >> "$GITHUB_OUTPUT"
+            echo "::error::held for review: large changes against the baseline (validate.txt); nothing is published"
+            exit 1
+          fi
+          [ "$rc" = 0 ] || { echo "::error::the build does not validate"; exit 1; }
           BUILD=$(python3 -I -c 'import json; print(json.load(open("build/manifest.json"))["build"])')
           if [ -n "$SERVED_BUILD" ] && [ "$BUILD" = "$SERVED_BUILD" ]; then
             echo "build $BUILD is the served one: nothing to publish" | tee -a "$GITHUB_STEP_SUMMARY"
@@ -130,15 +159,19 @@ jobs:
           python3 -I tools/winterpack_ci.py check art powerplants | tee -a "$GITHUB_STEP_SUMMARY"
           cp build/provenance.json provenance.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: powerplants-report
+          path: |
+            validate.txt
+            provenance.json
+          if-no-files-found: ignore
+          retention-days: 90
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
         with:
           name: powerplants-build
           path: art
           retention-days: 30
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
-        with:
-          name: powerplants-provenance
-          path: provenance.json
-          retention-days: 90
 
   publish:
     needs: [plan, build]
@@ -147,6 +180,8 @@ jobs:
       github.event.inputs.dry_run != 'true' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      version: ${{ steps.u.outputs.version }}
     env:
       AWS_DEFAULT_REGION: auto
       AWS_REQUEST_CHECKSUM_CALCULATION: when_required     # (R2 and aws-cli 2.23+'s default checksums: rail.yml)
@@ -159,41 +194,60 @@ jobs:
         with:
           name: powerplants-build
           path: art
-      - name: "Checked again, the version's keys listed, the files uploaded, the manifest last"
+      - id: u
+        name: "The version allocated from the whole prefix, the files uploaded, the manifest last"
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-          VERSION: ${{ needs.plan.outputs.version }}
+          SERVED: ${{ needs.plan.outputs.served }}
         run: |
           set -euo pipefail
           PACK=powerplants
           chk() { python3 -I tools/winterpack_ci.py "$@"; }
           chk check art "$PACK" | tee -a "$GITHUB_STEP_SUMMARY"
-          [ "$(chk key art "$PACK")" = "$VERSION" ] || { echo "::error::the artifact is not version $VERSION"; exit 1; }
+          # (list-objects-v2 exits 0 on an empty prefix and non-zero on an auth / network error: no silent "nothing there";
+          # the whole pack prefix: every version, published or cut off)
+          aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$PACK/" --endpoint-url "$R2" --output json > all.json
+          read -r MODE VERSION < <(chk allocate art "$PACK" --listing all.json --served "$SERVED")
+          [[ "$MODE" =~ ^(reuse|resume|new)$ && "$VERSION" =~ ^v[1-9][0-9]{0,3}$ ]] || { echo "::error::allocate: $MODE $VERSION"; exit 1; }
+          echo "release $VERSION ($MODE)" | tee -a "$GITHUB_STEP_SUMMARY"
           P="$PACK/$VERSION"
-          aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$P/" --endpoint-url "$R2" --output json > before.json
-          chk todo art "$PACK" --version "$VERSION" --listing before.json > todo.txt
-          echo "$(wc -l < todo.txt) files to upload to $P" | tee -a "$GITHUB_STEP_SUMMARY"
-          while read -r f k; do
-            [[ "$f" =~ ^art/$PACK/(power_plants\.npz|ATTRIBUTION\.md)$ && "$k" == "$P/${f#art/$PACK/}" ]] \
-              || { echo "::error::bad upload line: $f $k"; exit 1; }
-            case "$f" in *.md) ct="text/markdown; charset=utf-8";; *) ct=application/octet-stream;; esac
-            for try in 1 2 3; do
-              aws s3 cp "$f" "s3://$BUCKET/$k" --endpoint-url "$R2" --only-show-errors \
-                --content-type "$ct" --cache-control "public, max-age=31536000, immutable" < /dev/null && break
-              test "$try" -lt 3; sleep $((try * 20))
-            done
-          done < todo.txt
-          aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$P/" --endpoint-url "$R2" --output json > after.json
-          STATE=$(chk todo art "$PACK" --version "$VERSION" --listing after.json --complete)
-          if [ "$STATE" = "published" ]; then
-            echo "$P: published before (manifest there with the same size): not written again" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$MODE" = reuse ]; then
+            # (this build is published there complete: its own manifest, checked against the artifact's file, is the
+            # release; nothing is uploaded)
+            aws s3 cp "s3://$BUCKET/$P/manifest.json" art/$PACK/manifest.json --endpoint-url "$R2" --only-show-errors < /dev/null
+            chk check art "$PACK" | tee -a "$GITHUB_STEP_SUMMARY"
+            [ "$(chk key art "$PACK")" = "$VERSION" ] || { echo "::error::the published manifest is not $VERSION"; exit 1; }
           else
+            chk restamp art "$PACK" "$VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
+            aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$P/" --endpoint-url "$R2" --output json > before.json
+            chk todo art "$PACK" --version "$VERSION" --listing before.json > todo.txt
+            echo "$(wc -l < todo.txt) files to upload to $P" | tee -a "$GITHUB_STEP_SUMMARY"
+            while read -r f k; do
+              # (the names come from the checked manifest, never from a listing of the artifact)
+              [[ "$f" =~ ^art/$PACK/(power_plants\.npz|ATTRIBUTION\.md)$ && "$k" == "$P/${f#art/$PACK/}" ]] \
+                || { echo "::error::bad upload line: $f $k"; exit 1; }
+              case "$f" in *.md) ct="text/markdown; charset=utf-8";; *) ct=application/octet-stream;; esac
+              for try in 1 2 3; do
+                aws s3 cp "$f" "s3://$BUCKET/$k" --endpoint-url "$R2" --only-show-errors \
+                  --content-type "$ct" --cache-control "public, max-age=31536000, immutable" < /dev/null && break
+                test "$try" -lt 3; sleep $((try * 20))
+              done
+            done < todo.txt
+            aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$P/" --endpoint-url "$R2" --output json > after.json
+            STATE=$(chk todo art "$PACK" --version "$VERSION" --listing after.json --complete)
+            [ "$STATE" = files ] || { echo "::error::$P has a manifest already ($STATE): allocate said $MODE"; exit 1; }
             aws s3 cp "art/$PACK/manifest.json" "s3://$BUCKET/$P/manifest.json" --endpoint-url "$R2" --only-show-errors \
               --content-type application/json --cache-control "public, max-age=86400" < /dev/null
             echo "$P: every file uploaded, manifest.json last" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: powerplants-release
+          path: art
+          retention-days: 30
 
   live:
     needs: [plan, publish]
@@ -206,17 +260,19 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
         with:
-          name: powerplants-build
+          name: powerplants-release
           path: art
       - name: "Through the CDN: the manifest and the index, byte for byte"
         env:
-          VERSION: ${{ needs.plan.outputs.version }}
+          VERSION: ${{ needs.publish.outputs.version }}
         run: |
           set -euo pipefail
+          [[ "$VERSION" =~ ^v[1-9][0-9]{0,3}$ ]] || { echo "::error::bad version: $VERSION"; exit 1; }
+          [ "$(python3 -I tools/winterpack_ci.py key art powerplants)" = "$VERSION" ] || { echo "::error::the release is not $VERSION"; exit 1; }
           python3 -I tools/winterpack_ci.py live art powerplants --base "$CDN/powerplants/$VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
 
   flip:
-    needs: [plan, live]
+    needs: [plan, publish, live]
     if: ${{ !cancelled() && needs.live.result == 'success' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -228,7 +284,7 @@ jobs:
           ref: main
       - name: "cdn.json's powerplants key, last"
         env:
-          VERSION: ${{ needs.plan.outputs.version }}
+          VERSION: ${{ needs.publish.outputs.version }}
           SERVED: ${{ needs.plan.outputs.served }}
         run: |
           set -euo pipefail
@@ -242,7 +298,7 @@ jobs:
             [ "$NOW" = "$SERVED" ] || { echo "::warning::cdn.json names ${NOW:-none}, not ${SERVED:-none} as planned: nothing flipped"; exit 0; }
             python3 -I "$RUNNER_TEMP/winterpack_ci.py" cdn-key cdn.json powerplants "$VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
             if git diff --quiet -- cdn.json; then echo "cdn.json names $VERSION already"; exit 0; fi
-            git commit -q -m "cdn.json: power plants $VERSION for every player (powerplants workflow, run $GITHUB_RUN_ID: built twice, validated, published, checked through the CDN)" -- cdn.json
+            git commit -q -m "cdn.json: power plants $VERSION for every player (powerplants workflow, run $GITHUB_RUN_ID: built twice, validated against its baseline, published, checked through the CDN)" -- cdn.json
             if git push -q origin HEAD:main; then exit 0; fi
             sleep $((i * 10))
           done
@@ -250,7 +306,7 @@ jobs:
 
   notify:
     needs: [plan, build, publish, live, flip]
-    if: ${{ failure() && github.event_name == 'schedule' }}
+    if: ${{ failure() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -259,11 +315,17 @@ jobs:
       - name: "One issue (never twice)"
         env:
           GH_TOKEN: ${{ github.token }}
+          HELD: ${{ needs.build.outputs.held }}
         run: |
           set -euo pipefail
           RUN="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          TITLE="Power plants weekly build: needs attention"
-          BODY="The powerplants workflow stopped: $RUN. Nothing was flipped; cdn.json is unchanged and players keep the served build (or the app's bundled one). The next weekly run tries again; close this issue once it is fixed."
+          if [ "$HELD" = true ]; then
+            TITLE="Power plants weekly build: held for review"
+            BODY="The powerplants workflow held its build: large changes against the baseline (the run's summary and its powerplants-report artifact list them): $RUN. Nothing was published or flipped. If the changes are real (a mapping campaign, a source update), widen the bounds in tools/build_powerplants.py (GROWTH, REGION_*, ID_*) for one run, or run it by hand after checking; close this issue then."
+          else
+            TITLE="Power plants weekly build: needs attention"
+            BODY="The powerplants workflow stopped: $RUN. Nothing was flipped; cdn.json is unchanged and players keep the served build (or the app's bundled one). The next weekly run tries again (a version published without its flip is activated again, never rewritten); close this issue once it is fixed."
+          fi
           if gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"$TITLE\" in:title" --limit 1000 \
               --json title --jq '.[].title' | grep -Fxq -- "$TITLE"; then
             echo "an open issue says so already"

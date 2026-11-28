@@ -1,0 +1,1 @@
+{"file": "tools/data/power_plants_baseline.npz", "sha256": "f195df68a52656338ef5ec21665a804eebc43fe7830cef92ee7e6d4852ae1fc2", "from": "BeamNG.Earth server/power_plants.npz (the index bundled with the app, DATA_SHA256), branch power-plants 808b373b1", "note": "the first release's baseline; later releases compare with the served build"}
