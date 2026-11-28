@@ -257,45 +257,113 @@ class PowerPlantsTest(unittest.TestCase):
             self.assertEqual(self.run_ci("check", self.art(t, plants=100), "powerplants"), 1)
 
     # --- the release's version from the whole bucket prefix (powerplants.yml publish)
-    def allocate(self, art, keys, served=""):
+    def allocate(self, art, keys, served="", manifests=None):
+        """allocate's (exit code, stdout words, stderr) for a listing of keys [(key, size, etag)] and fetched manifests
+        {version: bytes}."""
         import contextlib
         import io
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-            json.dump({"Contents": [{"Key": k, "Size": sz, "ETag": f'"{et}"'} for k, sz, et in keys]}, f)
-        out = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(out):
-                code = self.run_ci("allocate", art, "powerplants", "--listing", f.name, "--served", served)
-        finally:
-            os.unlink(f.name)
-        return code, out.getvalue().split()
+        with tempfile.TemporaryDirectory() as md:
+            for v, body in (manifests or {}).items():
+                with open(os.path.join(md, v + ".json"), "wb") as f:
+                    f.write(body)
+            lst = os.path.join(md, "listing.json")
+            with open(lst, "w") as f:
+                json.dump({"Contents": [{"Key": k, "Size": sz, "ETag": f'"{et}"'} for k, sz, et in keys]}, f)
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = self.run_ci("allocate", art, "powerplants", "--listing", lst, "--served", served,
+                                   "--manifests", md)
+        return code, out.getvalue().split(), err.getvalue()
 
-    def npz_of(self, art):
-        p = os.path.join(art, "powerplants", "power_plants.npz")
+    def ident(self, art, name):
+        p = os.path.join(art, "powerplants", name)
         return os.path.getsize(p), hashlib.md5(open(p, "rb").read()).hexdigest()
+
+    def published(self, art, at, **change):
+        """The keys and the manifest of this build published complete at version at (change: manifest fields)."""
+        with open(os.path.join(art, "powerplants", "manifest.json")) as f:
+            m = json.load(f)
+        m["version"] = at
+        m.update(change)
+        body = json.dumps(m).encode()
+        keys = [(f"powerplants/{at}/power_plants.npz",) + self.ident(art, "power_plants.npz"),
+                (f"powerplants/{at}/ATTRIBUTION.md",) + self.ident(art, "ATTRIBUTION.md"),
+                (f"powerplants/{at}/manifest.json", len(body), hashlib.md5(body).hexdigest())]
+        return keys, body
 
     def test_first_release_is_v1(self):
         with tempfile.TemporaryDirectory() as t:
-            art = self.art(t)
-            self.assertEqual(self.allocate(art, []), (0, ["new", "v1"]))
+            self.assertEqual(self.allocate(self.art(t), [])[:2], (0, ["new", "v1"]))
 
     def test_past_every_used_prefix(self):
         with tempfile.TemporaryDirectory() as t:
             art = self.art(t)
             keys = [("powerplants/v1/power_plants.npz", 10, "a" * 32), ("powerplants/v1/manifest.json", 5, "b" * 32),
                     ("powerplants/v3/power_plants.npz", 11, "c" * 32)]          # (v3: an upload cut off)
-            self.assertEqual(self.allocate(art, keys, served="v1"), (0, ["new", "v4"]))
-            self.assertEqual(self.allocate(art, keys, served="v7"), (0, ["new", "v8"]), "a served rollback past them")
+            self.assertEqual(self.allocate(art, keys, served="v1")[:2], (0, ["new", "v4"]))
+            self.assertEqual(self.allocate(art, keys, served="v7")[:2], (0, ["new", "v8"]), "a served rollback past them")
 
     def test_this_build_published_is_reused(self):
         with tempfile.TemporaryDirectory() as t:
             art = self.art(t)
-            size, md5 = self.npz_of(art)
-            keys = [("powerplants/v2/power_plants.npz", size, md5), ("powerplants/v2/manifest.json", 300, "d" * 32),
-                    ("powerplants/v5/power_plants.npz", 10, "e" * 32)]
-            self.assertEqual(self.allocate(art, keys, served="v1"), (0, ["reuse", "v2"]))
-            keys[1] = ("powerplants/v2/ATTRIBUTION.md", 300, "d" * 32)      # (no manifest: finished there)
-            self.assertEqual(self.allocate(art, keys, served="v1"), (0, ["resume", "v2"]))
+            keys, body = self.published(art, "v2")
+            self.assertEqual(self.allocate(art, keys, served="v1", manifests={"v2": body})[:2], (0, ["reuse", "v2"]))
+
+    def test_a_cut_off_upload_of_this_build_is_resumed(self):
+        with tempfile.TemporaryDirectory() as t:
+            art = self.art(t)
+            keys, _ = self.published(art, "v2")
+            self.assertEqual(self.allocate(art, keys[:1], served="v1")[:2], (0, ["resume", "v2"]), "the file alone")
+            self.assertEqual(self.allocate(art, keys[:2], served="v1")[:2], (0, ["resume", "v2"]), "and its attribution")
+
+    def test_a_conflicting_oldest_prefix_is_skipped_for_a_later_one(self):
+        with tempfile.TemporaryDirectory() as t:
+            art = self.art(t)
+            k2, b2 = self.published(art, "v2")
+            k2[1] = ("powerplants/v2/ATTRIBUTION.md", k2[1][1] + 7, "f" * 32)     # (another attribution there)
+            k4, b4 = self.published(art, "v4")
+            code, out, err = self.allocate(art, k2 + k4, served="v1", manifests={"v2": b2, "v4": b4})
+            self.assertEqual((code, out), (0, ["reuse", "v4"]))
+            self.assertIn("conflict v2", err)
+
+    def test_conflicting_prefixes_only_give_a_new_version(self):
+        with tempfile.TemporaryDirectory() as t:
+            art = self.art(t)
+            k2, b2 = self.published(art, "v2", plants=6001)                      # (counts another build's)
+            k3, _ = self.published(art, "v3")
+            k3 = k3[:2] + [("powerplants/v3/extra.bin", 3, "e" * 32)]            # (an object outside the pack)
+            k5, _ = self.published(art, "v5")
+            bad = b"{not json"
+            k5[2] = ("powerplants/v5/manifest.json", len(bad), hashlib.md5(bad).hexdigest())   # (malformed)
+            k6, b6 = self.published(art, "v6", version="v9")                     # (names another version)
+            code, out, err = self.allocate(art, k2 + k3 + k5 + k6, served="v1",
+                                           manifests={"v2": b2, "v5": bad, "v6": b6})
+            self.assertEqual((code, out), (0, ["new", "v7"]))
+            for v in ("v2", "v3", "v5", "v6"):
+                self.assertIn(f"conflict {v}", err)
+
+    def test_a_manifest_listed_but_not_fetched_refuses(self):
+        with tempfile.TemporaryDirectory() as t:
+            art = self.art(t)
+            keys, _ = self.published(art, "v2")
+            self.assertEqual(self.allocate(art, keys, served="v1", manifests={})[0], 1, "a transient failure: run again")
+
+    def test_candidates_are_the_prefixes_to_fetch(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as t:
+            art = self.art(t)
+            k2, _ = self.published(art, "v2")
+            k3, _ = self.published(art, "v3")
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+                json.dump({"Contents": [{"Key": k, "Size": sz, "ETag": f'"{et}"'} for k, sz, et in k2 + k3[:1]]}, f)
+            out = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(out):
+                    self.run_ci("candidates", art, "powerplants", "--listing", f.name)
+            finally:
+                os.unlink(f.name)
+            self.assertEqual(out.getvalue().split(), ["v2"], "v3 has no manifest: nothing to fetch")
 
     def test_a_stray_key_refuses(self):
         with tempfile.TemporaryDirectory() as t:

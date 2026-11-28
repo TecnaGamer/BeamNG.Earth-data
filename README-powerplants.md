@@ -35,13 +35,18 @@ Deterministic: the workflow stages the index twice from the same inputs and comp
    `power_plants_baseline.json`). It checks the server reader's rules, the anchor plants (Drax, Gavin, Cattenom,
    Niederaussem, Irsching) with their mapped cooling towers, the plant and structure counts overall (0.9-1.15x) and per
    region (15-degree bands, north / south: 0.85-1.2x), and the OSM structures by element: at most 5 % removed, 2 %
-   moved over 200 m, 10 % added, 15 % removed or moved in a region. Over those bounds the build is **held for review**:
+   moved over 200 m, 10 % added, 15 % removed or moved in a region; the plants matched by their OSM element (or, for
+   one OSM does not map, by place within 1 km): at most 5 % gone, 2 % moved over 500 m, 3 % of another fuel, 5 % of
+   another state; the structures both hold: at most 2 % of another kind, 5 % of another height or diameter, 5 % of
+   another plant. Over those bounds the build is **held for review**:
    nothing is published and the run opens an issue. A build identical to the served one stops here.
 3. **publish** (R2 secrets; only `tools/winterpack_ci.py`, standard library, and aws-cli): the whole `powerplants/`
-   prefix is listed and the release's version allocated from it (`allocate`): a version already holding this build
-   complete is activated again as published (its own manifest; nothing uploaded), one holding this build's file
-   without a manifest (an upload cut off) is finished, and otherwise the release takes a new version past every one
-   the bucket or `cdn.json` has used. A published or half-published version is never written with another build, so a
+   prefix is listed and the release's version allocated from it (`candidates`, then `allocate`): every version
+   holding this build's file is checked completely (no other object, the same ATTRIBUTION.md, and its manifest,
+   fetched first, naming that version, this file and these counts); the oldest that checks is activated again as
+   published (its own manifest; nothing uploaded) or, without a manifest (an upload cut off), finished; a version with
+   anything conflicting is skipped; otherwise the release takes a new version past every one the bucket or
+   `cdn.json` has used. A manifest that cannot be fetched stops the run (a transient failure, tried again). A published or half-published version is never written with another build, so a
    failed CDN check or flip, or a rollback of `cdn.json`, never wedges the next week's run. The files are uploaded once
    (immutable), the manifest last.
 4. **live**: the CDN's copy compared byte for byte with the release.

@@ -783,10 +783,109 @@ def _region(lat, lon):
     return band * 2 + (np.asarray(lat) >= 0)
 
 
+PLANT_MATCH_M = 1000.0          # a plant OSM does not map: the same one when within this of its baseline point
+PLANT_MOVED_M = 500.0           # an OSM-mapped plant moved more than this
+PLANT_REMOVED_MAX = 0.05        # of the baseline's plants: at most this share gone ...
+PLANT_MOVED_MAX = 0.02          # ... moved ...
+PLANT_FUEL_MAX = 0.03           # ... of another fuel ...
+PLANT_STATE_MAX = 0.05          # ... running / closed the other way
+STRUCT_KIND_MAX = 0.02          # of the matched OSM structures: at most this share of another kind ...
+STRUCT_DIM_MAX = 0.05           # ... another height or diameter (over DIM_TOL_M, or mapped / unmapped) ...
+STRUCT_PLANT_MAX = 0.05         # ... another plant
+DIM_TOL_M = 1.0
+
+
+def _metres(lat0, lon0, lat1, lon1):
+    dy = (lat1 - lat0) * 110540.0
+    dx = (lon1 - lon0) * 111320.0 * np.cos(np.radians(lat0))
+    return np.hypot(dx, dy)
+
+
+def match_plants(new, base):
+    """{baseline plant index: new plant index}: an OSM-mapped plant by its element (type, id), one OSM does not map
+    by place (the nearest unmatched one OSM does not map either, within PLANT_MATCH_M; the baseline's in index order)."""
+    out = {}
+    bk = base["p_osm"].astype(np.int64) * 4 + base["p_osm_type"].astype(np.int64)
+    nk = new["p_osm"].astype(np.int64) * 4 + new["p_osm_type"].astype(np.int64)
+    by_key = {int(k): i for i, k in enumerate(nk) if new["p_osm"][i] > 0}
+    for i, k in enumerate(bk):
+        if base["p_osm"][i] > 0 and int(k) in by_key:
+            out[i] = by_key[int(k)]
+    free = np.flatnonzero(new["p_osm"] <= 0)
+    flat, flon = new["p_lat"][free] / 1e6, new["p_lon"][free] / 1e6
+    order = np.argsort(flat, kind="stable")
+    free, flat, flon = free[order], flat[order], flon[order]
+    taken = np.zeros(len(free), bool)
+    dlat = PLANT_MATCH_M / 110540.0
+    for i in np.flatnonzero(base["p_osm"] <= 0):
+        la, lo = base["p_lat"][i] / 1e6, base["p_lon"][i] / 1e6
+        a, b = np.searchsorted(flat, la - dlat), np.searchsorted(flat, la + dlat, side="right")
+        if a == b:
+            continue
+        d = _metres(la, lo, flat[a:b], flon[a:b])
+        d[taken[a:b]] = np.inf
+        j = int(np.argmin(d))
+        if d[j] <= PLANT_MATCH_M:
+            taken[a + j] = True
+            out[int(i)] = int(free[a + j])
+    return out
+
+
+def compare_attributes(new, base):
+    """[reason] for what changed in the plants and the OSM structures the baseline and the build share: plants removed,
+    moved, of another fuel or state (PLANT_*); structures of another kind, size or plant (STRUCT_*)."""
+    bad = []
+    m = match_plants(new, base)
+    nb = max(1, len(base["p_lat"]))
+    ib = np.array(sorted(m), np.int64)
+    in_ = np.array([m[i] for i in ib.tolist()], np.int64)
+    removed = nb - len(ib) if len(base["p_lat"]) else 0
+    osm = base["p_osm"][ib] > 0 if len(ib) else np.zeros(0, bool)
+    dist = _metres(base["p_lat"][ib] / 1e6, base["p_lon"][ib] / 1e6, new["p_lat"][in_] / 1e6, new["p_lon"][in_] / 1e6) \
+        if len(ib) else np.zeros(0)
+    moved = int((osm & (dist > PLANT_MOVED_M)).sum())
+    fuel = int((base["p_fuel"][ib] != new["p_fuel"][in_]).sum()) if len(ib) else 0
+    state = int((base["p_state"][ib] != new["p_state"][in_]).sum()) if len(ib) else 0
+    for what, count, top in (("plants removed", removed, PLANT_REMOVED_MAX), ("plants moved", moved, PLANT_MOVED_MAX),
+                             ("plants of another fuel", fuel, PLANT_FUEL_MAX),
+                             ("plants of another state", state, PLANT_STATE_MAX)):
+        print(f"{what}: {count} of {len(base['p_lat'])} ({count / nb:.2%})")
+        if count / nb > top:
+            bad.append(f"{what}: {count} of {len(base['p_lat'])} ({count / nb:.2%}, over {top:.0%})")
+    # the OSM structures both hold, by element
+    def keyed(d):
+        k = np.flatnonzero(d["s_osm"] > 0)
+        return {int(d["s_osm"][i]) * 4 + int(d["s_osm_type"][i]): int(i) for i in k}
+    sb, sn = keyed(base), keyed(new)
+    common = sorted(set(sb) & set(sn))
+    nc = max(1, len(common))
+    kind = dims = plant = 0
+    for key in common:
+        i, j = sb[key], sn[key]
+        if base["s_kind"][i] != new["s_kind"][j]:
+            kind += 1
+        for col in ("s_height", "s_diam"):
+            a, b = float(base[col][i]), float(new[col][j])
+            if np.isfinite(a) != np.isfinite(b) or (np.isfinite(a) and abs(a - b) > DIM_TOL_M):
+                dims += 1
+                break
+        pb, pn = int(base["s_plant"][i]), int(new["s_plant"][j])
+        if (m.get(pb, -2) if pb >= 0 else -1) != pn:
+            plant += 1
+    for what, count, top in (("structures of another kind", kind, STRUCT_KIND_MAX),
+                             ("structures of another size", dims, STRUCT_DIM_MAX),
+                             ("structures of another plant", plant, STRUCT_PLANT_MAX)):
+        print(f"{what}: {count} of {len(common)} ({count / nc:.2%})")
+        if count / nc > top:
+            bad.append(f"{what}: {count} of {len(common)} ({count / nc:.2%}, over {top:.0%})")
+    return bad
+
+
 def compare(new, base):
     """[reason] for a build against its baseline (both npz dicts): the whole index's counts (GROWTH), each region's
-    plants and structures (REGION_*), and the OSM structures by id: removed, moved over MOVED_M, added (ID_*), overall
-    and per region. [] when nothing is out of bounds. Prints the region table."""
+    plants and structures (REGION_*), the OSM structures by id: removed, moved over MOVED_M, added (ID_*), overall and
+    per region, and the plants and structures both hold (compare_attributes: plants by their OSM element or place,
+    moved, of another fuel or state; structures of another kind, size or plant). [] when nothing is out of bounds."""
     bad = []
     for key, lat, lon in (("plants", "p_lat", "p_lon"), ("structures", "s_lat", "s_lon")):
         nb, nn = len(base[lat]), len(new[lat])
@@ -834,7 +933,7 @@ def compare(new, base):
         if per_all[g] >= REGION_MIN and per_out[g] / per_all[g] > REGION_ID_MAX:
             bad.append(f"structures region {(g // 2) * BAND_DEG - 180}E {'N' if g % 2 else 'S'}: "
                        f"{int(per_out[g])} of {int(per_all[g])} removed or moved")
-    return bad
+    return bad + compare_attributes(new, base)
 
 
 def validate(out_dir, previous=None, baseline=None):

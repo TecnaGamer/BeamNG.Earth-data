@@ -18,9 +18,12 @@
 #            nothing is published, notify opens an issue). A build byte-identical to the served one stops here.
 #   publish  [R2 secrets: this repo's stdlib checker and aws-cli only; main only; not on dry runs] the whole
 #            powerplants/ prefix listed (every version, partial ones too); the release's version allocated from it
-#            (winterpack_ci.py allocate): a version holding this build complete is activated again as published (its own
-#            manifest), one holding this build's file without a manifest is finished, else a new version past every one
-#            used (never a published or half-published one): the files uploaded (immutable), manifest.json last; the
+#            (winterpack_ci.py candidates / allocate): each version holding this build's file is checked completely (no
+#            other object, the same ATTRIBUTION.md, a manifest naming it, this file and these counts); the oldest that
+#            checks is activated again as published (its own manifest) or, without a manifest, finished; a version
+#            with anything conflicting is skipped; else a new version past every one used (never a published or
+#            half-published one); a manifest that cannot be fetched stops the run (transient, tried again); the files
+#            uploaded (immutable), manifest.json last; the
 #            release (the artifact with its final manifest) handed on as powerplants-release
 #   live     [no secrets] manifest.json and the npz fetched through the CDN, byte-compared with the release
 #   flip     [contents write: this repo's stdlib checker and git only] cdn.json's powerplants key to the release's
@@ -209,14 +212,23 @@ jobs:
           # (list-objects-v2 exits 0 on an empty prefix and non-zero on an auth / network error: no silent "nothing there";
           # the whole pack prefix: every version, published or cut off)
           aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$PACK/" --endpoint-url "$R2" --output json > all.json
-          read -r MODE VERSION < <(chk allocate art "$PACK" --listing all.json --served "$SERVED")
+          # (each version already holding this build's file with a manifest: that manifest fetched, so allocate checks
+          # the version completely; a fetch that fails stops the run (transient: tried again), never a skip)
+          mkdir -p cands
+          chk candidates art "$PACK" --listing all.json > cands.txt
+          while read -r V; do
+            [[ "$V" =~ ^v[1-9][0-9]{0,3}$ ]] || { echo "::error::bad candidate: $V"; exit 1; }
+            aws s3 cp "s3://$BUCKET/$PACK/$V/manifest.json" "cands/$V.json" --endpoint-url "$R2" --only-show-errors < /dev/null
+          done < cands.txt
+          chk allocate art "$PACK" --listing all.json --served "$SERVED" --manifests cands > alloc.txt
+          read -r MODE VERSION < alloc.txt
           [[ "$MODE" =~ ^(reuse|resume|new)$ && "$VERSION" =~ ^v[1-9][0-9]{0,3}$ ]] || { echo "::error::allocate: $MODE $VERSION"; exit 1; }
           echo "release $VERSION ($MODE)" | tee -a "$GITHUB_STEP_SUMMARY"
           P="$PACK/$VERSION"
           if [ "$MODE" = reuse ]; then
             # (this build is published there complete: its own manifest, checked against the artifact's file, is the
             # release; nothing is uploaded)
-            aws s3 cp "s3://$BUCKET/$P/manifest.json" art/$PACK/manifest.json --endpoint-url "$R2" --only-show-errors < /dev/null
+            cp "cands/$VERSION.json" "art/$PACK/manifest.json"     # (checked by allocate: this version, file, counts)
             chk check art "$PACK" | tee -a "$GITHUB_STEP_SUMMARY"
             [ "$(chk key art "$PACK")" = "$VERSION" ] || { echo "::error::the published manifest is not $VERSION"; exit 1; }
           else

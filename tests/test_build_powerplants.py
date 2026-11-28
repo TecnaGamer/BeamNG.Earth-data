@@ -24,18 +24,31 @@ def index(n_plants=6000, n_structs=12000, seed=1):
     r = np.random.default_rng(seed)
     plat = np.sort(r.integers(-60_000_000, 70_000_000, n_plants)).astype(np.int32)
     slat = np.sort(r.integers(-60_000_000, 70_000_000, n_structs)).astype(np.int32)
+    osm = np.where(np.arange(n_plants) % 5 == 0, 0, np.arange(1, n_plants + 1)).astype(np.int64)   # (a fifth: GPPD)
     return {"p_lat": plat, "p_lon": r.integers(-179_000_000, 179_000_000, n_plants).astype(np.int32),
+            "p_osm": osm, "p_osm_type": np.ones(n_plants, np.uint8), "p_fuel": (np.arange(n_plants) % 6).astype(np.uint8),
+            "p_state": np.zeros(n_plants, np.uint8),
             "s_lat": slat, "s_lon": r.integers(-179_000_000, 179_000_000, n_structs).astype(np.int32),
-            "s_osm": np.arange(1, n_structs + 1, dtype=np.int64), "s_osm_type": np.ones(n_structs, np.uint8)}
+            "s_osm": np.arange(1, n_structs + 1, dtype=np.int64), "s_osm_type": np.ones(n_structs, np.uint8),
+            "s_kind": (np.arange(n_structs) % 3).astype(np.uint8),
+            "s_height": np.where(np.arange(n_structs) % 2, 100.0, np.nan).astype(np.float32),
+            "s_diam": np.full(n_structs, 8.0, np.float32),
+            "s_plant": (np.arange(n_structs) % n_plants).astype(np.int32)}
 
 
-def take(d, keep_p=None, keep_s=None):
+def take(d, keep_s=None):
     out = dict(d)
-    if keep_p is not None:
-        out["p_lat"], out["p_lon"] = d["p_lat"][keep_p], d["p_lon"][keep_p]
     if keep_s is not None:
-        for k in ("s_lat", "s_lon", "s_osm", "s_osm_type"):
+        for k in [c for c in d if c.startswith("s_")]:
             out[k] = d[k][keep_s]
+    return out
+
+
+def changed(d, **cols):
+    """d with some columns replaced (copies)."""
+    out = dict(d)
+    for k, f in cols.items():
+        out[k] = f(d[k].copy())
     return out
 
 
@@ -117,6 +130,47 @@ class Compare(unittest.TestCase):
     def test_a_few_changes_pass(self):
         d = index()
         new = take(d, keep_s=np.arange(10, len(d["s_lat"])))     # 10 structures gone of 12000
+        self.assertEqual(bp.compare(new, d), [])
+
+    def test_plants_moved_within_their_regions_are_held(self):
+        d = index()
+        k = np.flatnonzero(d["p_osm"] > 0)[::25]          # 3 % of the plants OSM maps, ~2 km north: same regions
+        new = changed(d, p_lat=lambda a: (a.__setitem__(k, a[k] + 20000), a)[1])
+        self.assertTrue(any("plants moved" in g for g in bp.compare(new, d)), bp.compare(new, d))
+        self.assertFalse(any("region" in g for g in bp.compare(new, d)), "the regions' counts alone never saw it")
+
+    def test_unmapped_plants_moved_far_are_held(self):
+        d = index()
+        k = np.flatnonzero(d["p_osm"] <= 0)[::3]           # GPPD points moved ~5 km: unmatched, counted gone
+        new = changed(d, p_lat=lambda a: (a.__setitem__(k, a[k] + 45000), a)[1])
+        self.assertTrue(any("plants removed" in g for g in bp.compare(new, d)))
+
+    def test_a_reclassified_structure_is_held(self):
+        d = index()
+        k = np.arange(0, len(d["s_kind"]), 30)             # 3 %: a chimney a cooling tower, same id and place
+        new = changed(d, s_kind=lambda a: (a.__setitem__(k, (a[k] + 1) % 3), a)[1])
+        got = bp.compare(new, d)
+        self.assertTrue(any("another kind" in g for g in got), got)
+        self.assertFalse(any("moved" in g or "removed" in g for g in got))
+
+    def test_fuel_state_size_and_plant_changes_are_held(self):
+        d = index()
+        k = np.arange(0, len(d["p_fuel"]), 20)
+        self.assertTrue(any("another fuel" in g for g in
+                            bp.compare(changed(d, p_fuel=lambda a: (a.__setitem__(k, (a[k] + 1) % 6), a)[1]), d)))
+        self.assertTrue(any("another state" in g for g in
+                            bp.compare(changed(d, p_state=lambda a: (a.__setitem__(np.arange(0, len(a), 10), 1), a)[1]), d)))
+        j = np.arange(0, len(d["s_kind"]), 10)
+        self.assertTrue(any("another size" in g for g in
+                            bp.compare(changed(d, s_height=lambda a: (a.__setitem__(j, 300.0), a)[1]), d)))
+        self.assertTrue(any("another plant" in g for g in
+                            bp.compare(changed(d, s_plant=lambda a: (a.__setitem__(j, (a[j] + 7) % len(d["p_lat"])), a)[1]),
+                                       d)))
+
+    def test_a_handful_of_real_edits_pass(self):
+        d = index()
+        new = changed(d, s_kind=lambda a: (a.__setitem__(np.arange(5), (a[:5] + 1) % 3), a)[1],
+                      p_state=lambda a: (a.__setitem__(np.arange(3), 1), a)[1])
         self.assertEqual(bp.compare(new, d), [])
 
     def test_bundled_baseline_against_itself(self):

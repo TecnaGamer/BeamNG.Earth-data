@@ -38,13 +38,18 @@ bucket is only compared (state=published); a change needs a new version. Nothing
                           manifest.json and the files (watershare: N of them, spread evenly, and the largest) fetched
                           through the CDN and compared byte for byte with the artifact
   next-version FILE PACK  the version after the one cdn.json's PACK key names (v1 when it names none)
-  allocate ART PACK --listing L [--served V]
+  candidates ART PACK --listing L
+                          the versions (oldest first) holding this build's file (size and MD5 ETag) and a manifest: the
+                          caller fetches each one's manifest.json into a folder as vN.json
+  allocate ART PACK --listing L [--served V] [--manifests DIR]
                           L: aws s3api list-objects-v2 of the whole PACK/ prefix (every version, partial ones too).
-                          Prints "reuse vN" when vN holds this build complete (its single file there with the
-                          artifact's size and MD5 ETag, and a manifest: the release is activated again as published),
-                          "resume vN" when vN holds this build's file but no manifest (an upload cut off: finished
-                          there), else "new vM" past every version the bucket or cdn.json (V) has used: a published or
-                          half-published version is never written with another build
+                          Each version holding this build's file, oldest first, is checked completely: no other object,
+                          its ATTRIBUTION.md the artifact's (size, MD5), and with a manifest (DIR/vN.json, its listed
+                          size) one that checks, names vN, this file and these counts: "reuse vN" (activated again as
+                          published); without a manifest: "resume vN" (finished there). A version with anything that
+                          conflicts is skipped (stderr). Else "new vM" past every version the bucket or cdn.json (V)
+                          has used: a published or half-published version is never written with another build. A
+                          listed manifest not fetched refuses (a transient failure: the run is tried again)
   restamp ART PACK VERSION
                           the artifact's manifest's version set to VERSION (nothing else changes), checked again
   cdn-key FILE PACK VERSION
@@ -518,31 +523,95 @@ def _md5_file(path):
     return h.hexdigest()
 
 
-def cmd_allocate(a):
-    """The version this build goes to (see the doc): reuse / resume / new."""
+def _versions(listing, pack):
+    """{version number: {file name: (size, etag)}} of a listing of the whole PACK/ prefix (refuses any other key)."""
+    with open(listing, encoding="utf-8") as f:
+        txt = f.read()
+    d = json.loads(txt) if txt.strip() else {}
+    seen = {}
+    for o in d.get("Contents") or []:
+        k = str(o.get("Key", ""))
+        mm = re.fullmatch(re.escape(pack) + r"/(v[1-9][0-9]{0,3})/([A-Za-z0-9_.-]+)", k)
+        if not mm:
+            refuse(f"listing: key {k!r} outside {pack}/<version>/")
+        seen.setdefault(int(mm.group(1)[1:]), {})[mm.group(2)] = (int(o.get("Size", -1)),
+                                                                  str(o.get("ETag", "")).strip('"').lower())
+    return seen
+
+
+def _matching(a):
+    """(the artifact's manifest, its file name, size, sha256, MD5, the attribution's (size, MD5), the versions, the
+    version numbers holding this build's file: same size and MD5 ETag, oldest first)."""
     root = os.path.join(a.art, a.pack)
     m, _ = load_manifest(root, a.pack)
     want = files_of(m, a.pack)
     if len(want) != 1:
         refuse("allocate: single-file packs only")
-    (fname, (size, _sha)), = want.items()
+    (fname, (size, sha)), = want.items()
     md5 = _md5_file(os.path.join(root, fname))
-    with open(a.listing, encoding="utf-8") as f:
-        txt = f.read()
-    d = json.loads(txt) if txt.strip() else {}
-    seen = {}                       # version number -> {file: (size, etag)}
-    for o in d.get("Contents") or []:
-        k = str(o.get("Key", ""))
-        mm = re.fullmatch(re.escape(a.pack) + r"/(v[1-9][0-9]{0,3})/([A-Za-z0-9_.-]+)", k)
-        if not mm:
-            refuse(f"listing: key {k!r} outside {a.pack}/<version>/")
-        seen.setdefault(int(mm.group(1)[1:]), {})[mm.group(2)] = (int(o.get("Size", -1)),
-                                                                  str(o.get("ETag", "")).strip('"').lower())
-    for n in sorted(seen):
-        f = seen[n].get(fname)
-        if f and f[0] == size and f[1] == md5:
-            print(("reuse" if "manifest.json" in seen[n] else "resume") + f" v{n}")
+    att = os.path.join(root, "ATTRIBUTION.md")
+    att_id = (os.path.getsize(att), _md5_file(att))
+    seen = _versions(a.listing, a.pack)
+    hits = [n for n in sorted(seen) if seen[n].get(fname) == (size, md5)]
+    return m, fname, size, sha, md5, att_id, seen, hits
+
+
+def cmd_candidates(a):
+    """The versions holding this build's file AND a manifest, oldest first: the manifests the publish job fetches
+    (into --manifests DIR as vN.json) before it allocates."""
+    _m, _f, _s, _h, _md5, _att, seen, hits = _matching(a)
+    for n in hits:
+        if "manifest.json" in seen[n]:
+            print(f"v{n}")
+
+
+def _candidate(a, n, files, m, fname, size, sha, att_id):
+    """('reuse' | 'resume', None) when version n can take this build, else (None, the conflict)."""
+    extra = set(files) - {fname, "ATTRIBUTION.md", "manifest.json"}
+    if extra:
+        return None, f"other objects {sorted(extra)[:3]}"
+    if "ATTRIBUTION.md" in files and files["ATTRIBUTION.md"] != att_id:
+        return None, "another ATTRIBUTION.md"
+    if "manifest.json" not in files:
+        return "resume", None
+    if "ATTRIBUTION.md" not in files:
+        return None, "a manifest without its ATTRIBUTION.md"
+    path = os.path.join(a.manifests or "", f"v{n}.json")
+    if not a.manifests or not os.path.isfile(path):
+        refuse(f"v{n}: its manifest was not fetched (candidates lists it): run again")    # (transient: not a conflict)
+    if os.path.getsize(path) != files["manifest.json"][0]:
+        return None, "the fetched manifest is not the listed one's size"
+    import shutil
+    import tempfile
+    with tempfile.TemporaryDirectory() as t:
+        os.makedirs(os.path.join(t, a.pack))
+        shutil.copyfile(path, os.path.join(t, a.pack, "manifest.json"))
+        try:
+            pm, _ = load_manifest(os.path.join(t, a.pack), a.pack)
+            pf = files_of(pm, a.pack)
+        except (Refused, ValueError, KeyError, TypeError) as e:
+            return None, f"its manifest does not check ({e})"
+    if pm.get("version") != f"v{n}":
+        return None, f"its manifest names {pm.get('version')!r}"
+    if pf != {fname: (size, sha)}:
+        return None, "its manifest names another file"
+    for k in ("plants", "structures", "records"):
+        if k in m and pm.get(k) != m[k]:
+            return None, f"its manifest's {k} differ"
+    return "reuse", None
+
+
+def cmd_allocate(a):
+    """The version this build goes to (see the doc): the oldest version holding this build that checks completely
+    (reuse / resume); versions holding it with anything that conflicts are skipped (said on stderr); else a new one
+    past every version used."""
+    m, fname, size, sha, _md5, att_id, seen, hits = _matching(a)
+    for n in hits:
+        mode, why = _candidate(a, n, seen[n], m, fname, size, sha, att_id)
+        if mode:
+            print(f"{mode} v{n}")
             return
+        print(f"conflict v{n}: {why}: skipped", file=sys.stderr)
     top = max(list(seen) + [0])
     if a.served:
         if not VERSION_RE.fullmatch(a.served):
@@ -612,6 +681,11 @@ def main(argv=None):
     p.add_argument("pack", choices=sorted(PACKS))
     p.add_argument("--listing", required=True)
     p.add_argument("--served", default="")
+    p.add_argument("--manifests", default="")
+    p = sub.add_parser("candidates")
+    p.add_argument("art")
+    p.add_argument("pack", choices=sorted(PACKS))
+    p.add_argument("--listing", required=True)
     p = sub.add_parser("restamp")
     p.add_argument("art")
     p.add_argument("pack", choices=sorted(PACKS))
@@ -639,6 +713,8 @@ def main(argv=None):
             cmd_next_version(a)
         elif a.cmd == "allocate":
             cmd_allocate(a)
+        elif a.cmd == "candidates":
+            cmd_candidates(a)
         elif a.cmd == "restamp":
             cmd_restamp(a)
         else:
